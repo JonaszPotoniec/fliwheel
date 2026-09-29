@@ -489,13 +489,10 @@ fn decode_texture_pixels_impl(
     }
 }
 
+#[inline(always)]
 pub fn sample_nearest(texture: &Texture, u: f32, v: f32) -> Rgba8 {
-    let x = u
-        .floor()
-        .clamp(0.0, (texture.width.saturating_sub(1)) as f32) as usize;
-    let y = v
-        .floor()
-        .clamp(0.0, (texture.height.saturating_sub(1)) as f32) as usize;
+    let x = if u <= 0.0 { 0 } else { (u as usize).min(texture.width.saturating_sub(1)) };
+    let y = if v <= 0.0 { 0 } else { (v as usize).min(texture.height.saturating_sub(1)) };
     texture.pixels[y * texture.width + x]
 }
 
@@ -544,31 +541,34 @@ pub fn sample_bilinear_premultiplied(texture: &Texture, u: f32, v: f32) -> Rgba8
     )
 }
 
+#[inline(always)]
 fn one_to_one_mapping(verts: &[(f32, f32, f32, f32); 3]) -> bool {
-    let extent = |index: usize| {
-        let (lo, hi): (f32, f32) = verts
-            .iter()
-            .map(|vertex| match index {
-                0 => vertex.0,
-                1 => vertex.1,
-                2 => vertex.2,
-                3 => vertex.3,
-                _ => unreachable!("vertex extent index"),
-            })
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), value| {
-                (lo.min(value), hi.max(value))
-            });
-        hi - lo
-    };
-    let (position_w, position_h) = (extent(0), extent(1));
-    let (uv_w, uv_h) = (extent(2), extent(3));
+    let (mut min_x, mut max_x) = (verts[0].0, verts[0].0);
+    let (mut min_y, mut max_y) = (verts[0].1, verts[0].1);
+    let (mut min_u, mut max_u) = (verts[0].2, verts[0].2);
+    let (mut min_v, mut max_v) = (verts[0].3, verts[0].3);
+    for v in &verts[1..] {
+        if v.0 < min_x { min_x = v.0; } else if v.0 > max_x { max_x = v.0; }
+        if v.1 < min_y { min_y = v.1; } else if v.1 > max_y { max_y = v.1; }
+        if v.2 < min_u { min_u = v.2; } else if v.2 > max_u { max_u = v.2; }
+        if v.3 < min_v { min_v = v.3; } else if v.3 > max_v { max_v = v.3; }
+    }
+    let (position_w, position_h) = (max_x - min_x, max_y - min_y);
+    let (uv_w, uv_h) = (max_u - min_u, max_v - min_v);
     position_w > 0.5
         && position_h > 0.5
         && (uv_w / position_w - 1.0).abs() < 0.02
         && (uv_h / position_h - 1.0).abs() < 0.02
 }
 
+#[inline(always)]
 pub fn blend_src_over(dst: Rgba8, src: Rgba8) -> Rgba8 {
+    if src.a == 0 {
+        return dst;
+    }
+    if src.a == 255 {
+        return src;
+    }
     let sa = src.a as u32;
     let da = dst.a as u32;
     let inv_sa = 255 - sa;
@@ -589,17 +589,23 @@ pub fn blend_src_over(dst: Rgba8, src: Rgba8) -> Rgba8 {
     )
 }
 
+#[inline(always)]
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
     (px - ax) * (by - ay) - (py - ay) * (bx - ax)
 }
 
+#[inline(always)]
 fn is_top_left(ax: f32, ay: f32, bx: f32, by: f32) -> bool {
     let dy = by - ay;
     let dx = bx - ax;
     dy > 0.0 || (dy == 0.0 && dx < 0.0)
 }
 
+#[inline(always)]
 fn modulate(src: Rgba8, tint: Rgba8) -> Rgba8 {
+    if tint.r == 255 && tint.g == 255 && tint.b == 255 && tint.a == 255 {
+        return src;
+    }
     let mul = |a: u8, b: u8| -> u8 { ((a as u16 * b as u16 + 127) / 255) as u8 };
     Rgba8::rgba(
         mul(src.r, tint.r),
@@ -642,30 +648,19 @@ pub fn rasterize_triangle_tinted_with_vertex_colors(
         }
     }
 
-    let min_x = v
-        .iter()
-        .map(|p| p.0)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i32;
-    let min_y = v
-        .iter()
-        .map(|p| p.1)
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as i32;
-    let max_x = v
-        .iter()
-        .map(|p| p.0)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min((fb_width - 1) as f32) as i32;
-    let max_y = v
-        .iter()
-        .map(|p| p.1)
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min((fb_height - 1) as f32) as i32;
+    let (mut min_x_f, mut max_x_f) = (v[0].0, v[0].0);
+    let (mut min_y_f, mut max_y_f) = (v[0].1, v[0].1);
+    for p in &v[1..] {
+        if p.0 < min_x_f { min_x_f = p.0; } else if p.0 > max_x_f { max_x_f = p.0; }
+        if p.1 < min_y_f { min_y_f = p.1; } else if p.1 > max_y_f { max_y_f = p.1; }
+    }
+    let min_x = min_x_f.floor().max(0.0) as i32;
+    let min_y = min_y_f.floor().max(0.0) as i32;
+    let max_x = max_x_f.ceil().min((fb_width - 1) as f32) as i32;
+    let max_y = max_y_f.ceil().min((fb_height - 1) as f32) as i32;
+    if min_x > max_x || min_y > max_y {
+        return 0;
+    }
 
     let area = edge(v[0].0, v[0].1, v[1].0, v[1].1, v[2].0, v[2].1);
     if area == 0.0 {
@@ -676,60 +671,69 @@ pub fn rasterize_triangle_tinted_with_vertex_colors(
     let tl12 = is_top_left(v[1].0, v[1].1, v[2].0, v[2].1);
     let tl20 = is_top_left(v[2].0, v[2].1, v[0].0, v[0].1);
 
+    let is_one_to_one = one_to_one_mapping(&v);
+    let inv_area = 1.0 / area;
+    let dy12 = v[2].1 - v[1].1;
+    let dy20 = v[0].1 - v[2].1;
+    let dy01 = v[1].1 - v[0].1;
+
     let mut coverage = 0u64;
     for y in min_y..=max_y {
+        let py = y as f32 + 0.5;
+        let mut e0 = edge(v[1].0, v[1].1, v[2].0, v[2].1, min_x as f32 + 0.5, py);
+        let mut e1 = edge(v[2].0, v[2].1, v[0].0, v[0].1, min_x as f32 + 0.5, py);
+        let mut e2 = edge(v[0].0, v[0].1, v[1].0, v[1].1, min_x as f32 + 0.5, py);
+
         for x in min_x..=max_x {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let e0 = edge(v[1].0, v[1].1, v[2].0, v[2].1, px, py);
-            let e1 = edge(v[2].0, v[2].1, v[0].0, v[0].1, px, py);
-            let e2 = edge(v[0].0, v[0].1, v[1].0, v[1].1, px, py);
-            let inside = (e0 > 0.0 || (e0 == 0.0 && tl12))
-                && (e1 > 0.0 || (e1 == 0.0 && tl20))
-                && (e2 > 0.0 || (e2 == 0.0 && tl01));
+            let cur_e0 = e0;
+            let cur_e1 = e1;
+            let cur_e2 = e2;
+            e0 += dy12;
+            e1 += dy20;
+            e2 += dy01;
+
+            let inside = (cur_e0 > 0.0 || (cur_e0 == 0.0 && tl12))
+                && (cur_e1 > 0.0 || (cur_e1 == 0.0 && tl20))
+                && (cur_e2 > 0.0 || (cur_e2 == 0.0 && tl01));
             if !inside {
                 continue;
             }
-            let inv_area = 1.0 / area;
-            let w0 = e0 * inv_area;
-            let w1 = e1 * inv_area;
-            let w2 = e2 * inv_area;
+            let w0 = cur_e0 * inv_area;
+            let w1 = cur_e1 * inv_area;
+            let w2 = cur_e2 * inv_area;
             let u = v[0].2 * w0 + v[1].2 * w1 + v[2].2 * w2;
             let vv = v[0].3 * w0 + v[1].3 * w1 + v[2].3 * w2;
-            let sample = if one_to_one_mapping(&v) {
+            let sample = if is_one_to_one {
                 sample_nearest(tex, u, vv)
             } else {
                 sample_bilinear_premultiplied(tex, u, vv)
             };
-            let primary = colors.map(|colors| {
-                let mut out = [0.0; 4];
-                for component in 0..4 {
-                    out[component] = (colors[0][component] * w0
-                        + colors[1][component] * w1
-                        + colors[2][component] * w2)
-                        .clamp(0.0, 1.0);
+            let src = match colors {
+                Some(colors) => {
+                    let w0 = cur_e0 * inv_area;
+                    let w1 = cur_e1 * inv_area;
+                    let w2 = cur_e2 * inv_area;
+                    let mut out = [0.0; 4];
+                    for component in 0..4 {
+                        out[component] = (colors[0][component] * w0
+                            + colors[1][component] * w1
+                            + colors[2][component] * w2)
+                            .clamp(0.0, 1.0);
+                    }
+                    let primary = Rgba8::rgba(
+                        (out[0] * 255.0).round() as u8,
+                        (out[1] * 255.0).round() as u8,
+                        (out[2] * 255.0).round() as u8,
+                        255,
+                    );
+                    modulate(modulate(sample, primary), tint)
                 }
-                out
-            });
-            let primary_modulated = primary.map(|primary| {
-                Rgba8::rgba(
-                    (primary[0] * 255.0).round() as u8,
-                    (primary[1] * 255.0).round() as u8,
-                    (primary[2] * 255.0).round() as u8,
-                    // The direct PR #3 textured path uses the color array
-                    // for RGB modulation only. Texture alpha is the source
-                    // coverage; an enabled color array's fourth component
-                    // does not make an otherwise opaque GL_RGB/RGB565 quad
-                    // translucent.
-                    255,
-                )
-            });
-            let src = match primary_modulated {
-                Some(primary) => modulate(modulate(sample, primary), tint),
                 None => modulate(sample, tint),
             };
             let idx = y as usize * fb_width + x as usize;
-            fb[idx] = blend_src_over(fb[idx], src);
+            if src.a > 0 {
+                fb[idx] = blend_src_over(fb[idx], src);
+            }
             coverage += 1;
         }
     }

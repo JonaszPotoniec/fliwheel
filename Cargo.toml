@@ -1,9 +1,12 @@
 [workspace]
-members = ["core", "desktop"]
+members = ["core", "desktop", "android"]
 exclude = ["vendor/armv4t_emu"]
 
 [profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
 panic = "abort"
-debug = true
+debug = false
 [patch."https://github.com/daniel5151/armv4t_emu.git"]
 armv4t_emu = { path = "vendor/armv4t_emu" }

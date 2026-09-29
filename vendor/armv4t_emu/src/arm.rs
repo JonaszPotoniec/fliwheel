@@ -30,6 +30,7 @@ enum Instruction {
     Undefined,
 }
 
+#[allow(dead_code)]
 const INST_MATCH_ORDER: [Instruction; 18] = [
     Instruction::Branch,
     Instruction::BranchEx,
@@ -52,6 +53,7 @@ const INST_MATCH_ORDER: [Instruction; 18] = [
 ];
 
 impl Instruction {
+    #[allow(dead_code)]
     #[inline]
     #[rustfmt::skip]
     fn pattern(self) -> (u32, u32) {
@@ -78,14 +80,64 @@ impl Instruction {
         }
     }
 
+    #[inline]
     fn decode(inst: u32) -> Instruction {
-        for typ in INST_MATCH_ORDER.iter() {
-            let (mask, test) = typ.pattern();
-            if inst.mask_match(mask, test) {
-                return *typ;
+        let class = (inst >> 25) & 7;
+        match class {
+            0b000 => {
+                if (inst & 0x0fff_fff0) == 0x012f_ff10 {
+                    Instruction::BranchEx
+                } else if (inst & 0x0fb0_0ff0) == 0x0100_0090 {
+                    Instruction::Swap
+                } else if (inst & 0x0fc0_00f0) == 0x0000_0090 {
+                    Instruction::Multiply
+                } else if (inst & 0x0f80_00f0) == 0x0080_0090 {
+                    Instruction::MulLong
+                } else if (inst & 0x0e40_0f90) == 0x0000_0090 {
+                    Instruction::HwSgnXferR
+                } else if (inst & 0x0e40_0090) == 0x0040_0090 {
+                    Instruction::HwSgnXferI
+                } else if (inst & 0x0f90_0ff0) == 0x0100_0000 {
+                    Instruction::PsrReg
+                } else if (inst & 0x0e00_0010) == 0x0000_0000 {
+                    Instruction::DataProc0
+                } else if (inst & 0x0e00_0090) == 0x0000_0010 {
+                    Instruction::DataProc1
+                } else {
+                    Instruction::Undefined
+                }
             }
+            0b001 => {
+                if (inst & 0x0fb0_0000) == 0x0320_0000 {
+                    Instruction::PsrImm
+                } else if (inst & 0x0e00_0000) == 0x0200_0000 {
+                    Instruction::DataProc2
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            0b010 => Instruction::SingleXferI,
+            0b011 => {
+                if (inst & 0x0e00_0010) == 0x0600_0000 {
+                    Instruction::SingleXferR
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            0b100 => Instruction::BlockXfer,
+            0b101 => Instruction::Branch,
+            0b110 => Instruction::Undefined,
+            0b111 => {
+                if (inst & 0x0f00_0000) == 0x0f00_0000 {
+                    Instruction::SoftwareInt
+                } else if (inst & 0x0f00_0010) == 0x0e00_0010 {
+                    Instruction::CoprocReg
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            _ => unreachable!(),
         }
-        Instruction::Undefined
     }
 }
 
@@ -101,7 +153,7 @@ impl Cpu {
         let cpsr = self.reg[reg::CPSR];
 
         #[cfg(not(feature = "advanced_disasm"))]
-        {
+        if log_enabled!(log::Level::Trace) {
             let cflags = cpsr.extract(28, 4);
             trace!(
                 "ARM: pc: {:#010x}, inst: {:#010x}, cond: {:#03x}, cflags: {:04b}",
@@ -110,7 +162,6 @@ impl Cpu {
                 cond,
                 cflags
             );
-            let inst_type = Instruction::decode(inst);
             trace!("Instruction: {:?}", inst_type);
         }
         #[cfg(feature = "advanced_disasm")]
@@ -573,7 +624,12 @@ impl Cpu {
                 self.reg[rd] = val;
             }
             SoftwareInt => {
-                self.exception(Exception::Software);
+                let comment = inst & 0x00ff_ffff;
+                if comment == 0x123456 {
+                    self.swi_semihosting = true;
+                } else {
+                    self.exception(Exception::Software);
+                }
             }
             CoprocReg => {
                 let cpopc = inst.extract(21, 3);

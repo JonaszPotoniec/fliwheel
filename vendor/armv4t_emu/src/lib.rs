@@ -112,6 +112,8 @@ pub trait Memory {
 pub struct Cpu {
     /// Registers
     reg: RegFile,
+    /// Set when a semihosting SWI (0x123456) is executed
+    pub swi_semihosting: bool,
     /// Disassembler
     #[cfg(feature = "advanced_disasm")]
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -141,6 +143,7 @@ impl Cpu {
     pub fn new() -> Cpu {
         let mut cpu = Cpu {
             reg: RegFile::new_empty(),
+            swi_semihosting: false,
             #[cfg(feature = "advanced_disasm")]
             cs: Some(
                 Capstone::new()

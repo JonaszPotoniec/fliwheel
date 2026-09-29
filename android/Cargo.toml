@@ -1,0 +1,14 @@
+[package]
+name = "fliwheel-android"
+version = "0.1.0"
+edition = "2018"
+
+[lib]
+name = "fliwheel_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+fliwheel-core = { path = "../core" }
+jni = { version = "0.21", default-features = false }
+log = "0.4"
+android_logger = "0.13"

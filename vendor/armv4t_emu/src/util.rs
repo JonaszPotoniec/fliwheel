@@ -2,6 +2,7 @@ pub mod bit {
     /// Collection of useful bit manipulation methods (sepcifically for u32)
     pub trait BitUtilExt {
         fn extract(self, off: u8, len: u8) -> u32;
+        #[allow(dead_code)]
         fn mask_match(self, mask: u32, test: u32) -> bool;
         fn set_bit(self, off: u8, len: u8, val: u32) -> u32;
         fn get_bit(self, bit: u8) -> u32;
@@ -43,6 +44,7 @@ pub mod bit {
             (self >> off) & ((1u32 << len) - 1)
         }
 
+        #[allow(dead_code)]
         #[inline]
         fn mask_match(self, mask: u32, test: u32) -> bool {
             ((self ^ test) & mask) == 0

@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -658,11 +659,13 @@ pub struct Eapp {
     lost_wheel_raw: u8,
     lost_wheel_remainder: f32,
     lost_wheel_pending: VecDeque<u8>,
+    lost_wheel_last_step: i16,
     /// Hold'em uses the same 120-step/raw-byte input stream as the PR #3
     /// runner, but keeps its cursor independent from LOST/Vortex.
     holdem_wheel_raw: u8,
     holdem_wheel_remainder: f32,
     holdem_wheel_pending: VecDeque<u8>,
+    holdem_wheel_last_step: i16,
     render_state: Arc<Mutex<Vec<u32>>>,
     controls: Option<EappBinds>,
     next_alloc: u32,
@@ -796,6 +799,8 @@ pub struct Eapp {
     gl_capture: Option<GlTraceRecorder>,
     staged_file_generation: u64,
     halted: bool,
+    stop_signal: Arc<AtomicBool>,
+    frame_seq: Arc<AtomicU64>,
     /// Optional live OpenGLES HLE state. Present only when
     /// `FLIWHEEL_EXPERIMENTAL_GL_HLE=1`; when `None` the legacy fill-color
     /// GL path is used unchanged.
@@ -803,6 +808,13 @@ pub struct Eapp {
     /// Parsed shader/render-server program from OpenGLES:164 (`rserver.bin`).
     usse_program: Option<UsseProgram>,
     usse_vm: UsseVm,
+    pub is_tetris: bool,
+    pub is_vortex: bool,
+    pub is_pacman: bool,
+    pub is_mspacman: bool,
+    pub is_holdem: bool,
+    pub is_popcap: bool,
+    pub string_trace_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -978,13 +990,25 @@ pub enum EappBuildError {
 
 impl Eapp {
     pub fn from_bundle_dir(bundle_dir: impl AsRef<Path>) -> Result<Eapp, EappBuildError> {
-        let bundle_dir = bundle_dir.as_ref().to_path_buf();
+        let mut bundle_dir = bundle_dir.as_ref().to_path_buf();
+        if !bundle_dir.join("Executables").exists() {
+            if let Ok(entries) = fs::read_dir(&bundle_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() && p.join("Executables").exists() {
+                        bundle_dir = p;
+                        break;
+                    }
+                }
+            }
+        }
         let executable_path = find_game_executable(&bundle_dir)?;
-        let title = bundle_dir
+        let raw_title = bundle_dir
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
             .unwrap_or_else(|| executable_path.display().to_string());
+        let title = canonicalize_game_title(&raw_title, &bundle_dir, &executable_path);
         let metadata = EappMetadata {
             title,
             bundle_dir,
@@ -1044,6 +1068,19 @@ impl Eapp {
         let mut game_heap = Ram::new(GAME_HEAP_SIZE);
         game_heap.bulk_write(0, &vec![0u8; GAME_HEAP_SIZE]);
 
+        let title_str = image.metadata.title.as_str();
+        let bundle_path_str = image.metadata.bundle_dir.to_str().unwrap_or("");
+        let is_tetris = title_str == "66666" || bundle_path_str.contains("66666");
+        let is_vortex = title_str == "12345" || bundle_path_str.contains("12345");
+        let is_pacman = title_str == "AAAAA" || bundle_path_str.contains("AAAAA");
+        let is_mspacman = title_str == "14004" || bundle_path_str.contains("14004");
+        let is_holdem = title_str == "33333" || bundle_path_str.contains("33333");
+        let is_popcap = matches!(title_str, "44444" | "55555" | "99999")
+            || bundle_path_str.contains("44444")
+            || bundle_path_str.contains("55555")
+            || bundle_path_str.contains("99999");
+        let string_trace_enabled = string_trace_enabled();
+
         let mut eapp = Eapp {
             cpu,
             bus: EappBus {
@@ -1096,9 +1133,11 @@ impl Eapp {
             lost_wheel_raw: 0,
             lost_wheel_remainder: 0.0,
             lost_wheel_pending: VecDeque::new(),
+            lost_wheel_last_step: 0,
             holdem_wheel_raw: 0,
             holdem_wheel_remainder: 0.0,
             holdem_wheel_pending: VecDeque::new(),
+            holdem_wheel_last_step: 0,
             render_state,
             controls: Some(controls),
             next_alloc: WORK_RAM_BASE + 0x1000,
@@ -1160,9 +1199,18 @@ impl Eapp {
             gl_capture: None,
             staged_file_generation: 0,
             halted: false,
+            stop_signal: Arc::new(AtomicBool::new(false)),
+            frame_seq: Arc::new(AtomicU64::new(0)),
             live_gl: Self::maybe_init_live_gl(game_id),
             usse_program: None,
             usse_vm: UsseVm::default(),
+            is_tetris,
+            is_vortex,
+            is_pacman,
+            is_mspacman,
+            is_holdem,
+            is_popcap,
+            string_trace_enabled,
         };
         let preload_manifest = fliwheel_var_os("GL_PRELOAD_MANIFEST")
             .map(|value| value.to_string_lossy() == "1" || value.to_string_lossy() == "true")
@@ -1260,8 +1308,20 @@ impl Eapp {
         })
     }
 
+    pub fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_signal)
+    }
+
+    pub fn frame_seq(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.frame_seq)
+    }
+
+    pub fn halt(&self) {
+        self.stop_signal.store(true, Ordering::Relaxed);
+    }
+
     pub fn run(&mut self) -> FatalMemResult<()> {
-        while !self.halted {
+        while !self.halted && !self.stop_signal.load(Ordering::Relaxed) {
             self.step()?;
         }
         Ok(())
@@ -1269,7 +1329,7 @@ impl Eapp {
 
     pub fn run_cycles(&mut self, cycles: usize) -> FatalMemResult<()> {
         for _ in 0..cycles {
-            if self.halted {
+            if self.halted || self.stop_signal.load(Ordering::Relaxed) {
                 break;
             }
             self.step()?;
@@ -1976,21 +2036,6 @@ impl Eapp {
             self.maybe_present_dma_frame();
         }
         let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
-        self.record_pc(pc);
-        // Surface the current PC to the bus so write-watchpoint hits can be
-        // tagged with the writer's PC. Set before `cpu.step`, which may emit
-        // memory writes for the instruction at `pc`.
-        self.bus.previous_pc = self.bus.pending_pc;
-        self.bus.previous_lr = self.bus.pending_lr;
-        self.bus.pending_pc = pc;
-        self.bus.watch_frame = self.frame_counter;
-        let mode = self.cpu.mode();
-        for idx in 0..4 {
-            self.bus.pending_regs[idx] = self.cpu.reg_get(mode, idx as u8);
-        }
-        self.bus.pending_lr = self.cpu.reg_get(mode, reg::LR);
-        self.bus.pending_sp = self.cpu.reg_get(mode, reg::SP);
-        self.bus.trace_memcpy(pc);
         if pc == BOOTSTRAP_RETURN_PC || (pc == 0 && self.bootstrap_phase != BootstrapPhase::Done) {
             self.handle_bootstrap_return();
             return Ok(());
@@ -1999,9 +2044,25 @@ impl Eapp {
             self.handle_guest_callback_return();
             return Ok(());
         }
-        if let Some(&import_idx) = self.trampoline_to_import.get(&pc) {
-            self.handle_import(import_idx)?;
-            return Ok(());
+        if (TRAMPOLINE_BASE..TRAMPOLINE_BASE + 0x10000).contains(&pc) {
+            if let Some(&import_idx) = self.trampoline_to_import.get(&pc) {
+                self.handle_import(import_idx)?;
+                return Ok(());
+            }
+        }
+        if self.bus.watch.is_some() || self.bus.memcpy_trace_remaining > 0 {
+            self.record_pc(pc);
+            self.bus.previous_pc = self.bus.pending_pc;
+            self.bus.previous_lr = self.bus.pending_lr;
+            self.bus.pending_pc = pc;
+            self.bus.watch_frame = self.frame_counter;
+            let mode = self.cpu.mode();
+            for idx in 0..4 {
+                self.bus.pending_regs[idx] = self.cpu.reg_get(mode, idx as u8);
+            }
+            self.bus.pending_lr = self.cpu.reg_get(mode, reg::LR);
+            self.bus.pending_sp = self.cpu.reg_get(mode, reg::SP);
+            self.bus.trace_memcpy(pc);
         }
 
         // Tetris parsed-resource RE shim for AsyncFileIO:0 wav streaming.
@@ -2014,14 +2075,10 @@ impl Eapp {
         // queued owner callback (`0x1801fbfc`) still performs the real callback
         // cascade and byte-count forwarding once control returns.
         if pc == 0x1801_fd50u32
+            && self.is_tetris
             && fliwheel_var("EAPP_ASYNC3_COMPLETE")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false)
-            && self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("66666"))
         {
             let mode = self.cpu.mode();
             let req = self.cpu.reg_get(mode, 4);
@@ -2047,12 +2104,7 @@ impl Eapp {
         // Bootstrap preallocates work-RAM scratch structures for both cases.
         // This is intentionally gated by bundle id and exact PC/range so
         // working titles cannot observe it.
-        if self
-            .metadata
-            .bundle_dir
-            .to_str()
-            .map_or(false, |p| p.contains("12345"))
-        {
+        if self.is_vortex {
             if pc == 0x1801_4d54u32 || pc == 0x1801_1290u32 {
                 let mode = self.cpu.mode();
                 let current_r0 = self.cpu.reg_get(mode, 0);
@@ -2142,13 +2194,9 @@ impl Eapp {
         // completion request/owner that reaches the game's callback trampoline
         // at 0x1802fcc4 before the known null-owner fatal at 0x1802fd00.
         // Disabled by default; enable with EAPP_TEXAS_TRACE=1.
-        if std::env::var_os("EAPP_TEXAS_TRACE").is_some()
-            && self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("33333"))
+        if self.is_holdem
             && (pc == 0x1802_fcc4u32 || pc == 0x1802_fcf0u32 || pc == 0x1802_fd00u32)
+            && std::env::var_os("EAPP_TEXAS_TRACE").is_some()
         {
             let mode = self.cpu.mode();
             let r0 = self.cpu.reg_get(mode, 0);
@@ -2235,7 +2283,7 @@ impl Eapp {
         // Older RE (iter 20): downstream PC-hook injection retained for direct
         // comparison. Prefer `FLIWHEEL_EAPP_HOST_EVENT_FLAGS=0x18` now because it
         // uses the guest's real `0x50b0 -> 0x5aa4` event-copy path.
-        if fliwheel_var_os("EAPP_AUDIO_SLOT_BIT").is_some() && pc == 0x1801_b630u32 {
+        if pc == 0x1801_b630u32 && fliwheel_var_os("EAPP_AUDIO_SLOT_BIT").is_some() {
             let bit: u32 = fliwheel_var("EAPP_AUDIO_SLOT_BIT_VAL")
                 .ok()
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
@@ -2247,7 +2295,7 @@ impl Eapp {
         // 0x180083b4, after the `cmp r3,#0; bxeq lr` guard). r0=text_obj,
         // r3=ptr to time value, *r3 = the time value (signed). Confirms
         // whether the garbage chars (' .) come from a negative *r3.
-        if texgen_verbose_enabled() && pc == TEXT_FORMAT_TIME_ENTRY_PC {
+        if pc == TEXT_FORMAT_TIME_ENTRY_PC && texgen_verbose_enabled() {
             let mode = self.cpu.mode();
             let text_obj = self.cpu.reg_get(mode, 0);
             let time_ptr = self.cpu.reg_get(mode, 3);
@@ -2264,12 +2312,15 @@ impl Eapp {
         self.maybe_trace_guest_pc(pc);
 
         self.maybe_patch_guest_state(pc);
-        if self.handle_guest_svc(pc) {
-            return Ok(());
-        }
 
         let mut mem = MemoryAdapter::new(&mut self.bus);
         self.cpu.step(&mut mem);
+        if self.cpu.swi_semihosting {
+            self.cpu.swi_semihosting = false;
+            let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC).wrapping_sub(4);
+            self.handle_guest_svc_dispatch(pc);
+            return Ok(());
+        }
         if let Some((access, e)) = mem.exception.take() {
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
             warn!(target: "EAPP", "recent pc trace: {}", self.format_recent_pcs());
@@ -2684,8 +2735,8 @@ impl Eapp {
     /// the flag is absent or not enabled, so default behavior is unchanged.
     fn maybe_init_live_gl(game_id: String) -> Option<LiveGlState> {
         let enabled = fliwheel_var_os("EXPERIMENTAL_GL_HLE")
-            .map(|v| v.to_string_lossy() == "1")
-            .unwrap_or(false);
+            .map(|v| v.to_string_lossy() != "0")
+            .unwrap_or(true);
         if !enabled {
             return None;
         }
@@ -2694,11 +2745,11 @@ impl Eapp {
             .map(|n| n != 0)
             .unwrap_or_else(|| live_gl_default_present_vflip(&game_id));
         let gate_b = fliwheel_var_os("GL_GATE_B")
-            .map(|v| v.to_string_lossy() == "1")
-            .unwrap_or(false);
+            .map(|v| v.to_string_lossy() != "0")
+            .unwrap_or(true);
         let continuous = fliwheel_var_os("GL_LIVE_CONTINUOUS")
-            .map(|v| v.to_string_lossy() == "1")
-            .unwrap_or(false);
+            .map(|v| v.to_string_lossy() != "0")
+            .unwrap_or(true);
         let dump_frames = fliwheel_var_os("GL_DUMP_FRAMES")
             .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
             .unwrap_or(0);
@@ -2866,6 +2917,10 @@ impl Eapp {
                 self.live_handle_ordinal_165(args);
                 0
             }
+            166 => {
+                self.live_handle_ordinal_166(args);
+                0
+            }
             // Ordinal 164: shader program create/link. Takes pointer to shader
             // binary (rserver.bin), returns a program ID. Must return non-zero
             // so the game sees a valid program. Lost and TWA both use this.
@@ -2947,8 +3002,9 @@ impl Eapp {
             }
             // Ordinal 167: shader program use/bind. Lost doesn't call this but TWA does.
             167 => {
-                if self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some()
+                if (self.metadata.title == "12345"
+                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
+                    || self.live_is_holdem()
                 {
                     self.live_handle_vortex_ortho(args);
                 } else {
@@ -3021,9 +3077,16 @@ impl Eapp {
                 }
                 0
             }
-            // Draw-adjacent state ordinal; retained as a no-op until a title
-            // proves a fixed-function matrix contract for it.
-            149 => 0,
+            // OpenGLES:149 is glUniformMatrix4xvAPPLE (fixed-point matrix uniform).
+            149 => {
+                if (self.metadata.title == "12345"
+                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
+                    || self.live_is_holdem()
+                {
+                    self.live_handle_mvp_fixed(args);
+                }
+                0
+            }
             // OpenGLES:125 is glUniformMatrix4fv in the direct Vortex path.
             // The oracle uploads the current model/projection matrix through
             // r3 before each model-space draw. Keep this title-scoped while
@@ -3301,12 +3364,14 @@ impl Eapp {
             return; // one-shot diagnostic capture keeps its existing heuristic
         }
         // Read DMA framebuffer before borrowing live_gl (for PopCap background)
-        let mut dma_data = {
+        let mut dma_data = Vec::new();
+        let mut has_dma = false;
+        if self.is_popcap || self.bus.hw_dma_dirty || (self.frame_counter <= 1 && fliwheel_var_os("EAPP_LOST_SPLASH").is_some()) {
             let mut buf = vec![0u8; DMA_FB_SIZE];
             self.bus.dma_framebuf.bulk_read(0, &mut buf);
-            buf
-        };
-        let mut has_dma = dma_data.iter().any(|b| *b != 0x2d);
+            has_dma = buf.iter().any(|b| *b != 0x2d);
+            dma_data = buf;
+        }
 
         // Lost splash screen injection: if no DMA data and the env var is set,
         // load the lostLaunch.raw.lcd5 from the bundle and write it to the
@@ -3577,7 +3642,7 @@ impl Eapp {
                 source_file: None,
                 source_file_offset: None,
                 format: Some(format),
-                texture: Some(texture),
+                texture: Some(Arc::new(texture)),
                 tex_name: Some(material_handle),
             });
             lg.resource_uploads_by_handle.insert(material_handle, index);
@@ -3780,11 +3845,11 @@ impl Eapp {
                 .as_ref()
                 .map(|b| source_ptr.saturating_sub(b.base_addr)),
             format: Some(TextureFormat::Rgba8888),
-            texture: Some(Texture {
+            texture: Some(Arc::new(Texture {
                 width,
                 height,
                 pixels,
-            }),
+            })),
             tex_name,
         };
         info!(
@@ -4006,10 +4071,12 @@ impl Eapp {
     }
 
     fn live_is_holdem(&self) -> bool {
-        self.metadata
-            .bundle_dir
-            .to_str()
-            .is_some_and(|path| path.contains("33333"))
+        self.metadata.title == "33333"
+            || self
+                .metadata
+                .bundle_dir
+                .to_str()
+                .is_some_and(|path| path.contains("33333"))
     }
 
     /// Apply the matrix helpers used by the direct PR #3 title oracles.
@@ -4127,6 +4194,31 @@ impl Eapp {
             info!(
                 target: "EAPP_GL",
                 "mvp ptr={:#010x} m={matrix:?}",
+                args[3]
+            );
+        }
+    }
+
+    /// Capture the vertex MVP uploaded by OpenGLES:149 (fixed-point matrix).
+    fn live_handle_mvp_fixed(&mut self, args: [u32; 4]) {
+        if args[0] != 0 || args[1] == 0 || args[3] == 0 {
+            return;
+        }
+        let ptr = args[3];
+        let mut matrix = [0.0f32; 16];
+        for (i, val) in matrix.iter_mut().enumerate() {
+            let Some(raw) = self.read_guest_u32(ptr.wrapping_add((i as u32) * 4)) else {
+                return;
+            };
+            *val = (raw as i32) as f32 / 65_536.0;
+        }
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.mvp = Some(matrix);
+        }
+        if fliwheel_var_os("GL_MATRIX_LOG").is_some() {
+            info!(
+                target: "EAPP_GL",
+                "mvp_fixed ptr={:#010x} m={matrix:?}",
                 args[3]
             );
         }
@@ -4319,7 +4411,9 @@ impl Eapp {
         // The direct PR #3 runner binds ordinal 165 to the ordinary
         // glLoadIdentity contract. Keep the older Vortex surface wiring
         // available for comparison, but allow an exact oracle-style A/B.
-        if self.metadata.title == "12345" && fliwheel_var_os("VORTEX_PR3_GL165").is_some() {
+        if (self.metadata.title == "12345" && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
+            || self.live_is_holdem()
+        {
             if state_ptr != 0 {
                 for i in 0..16u32 {
                     let value = if i % 5 == 0 {
@@ -4330,9 +4424,12 @@ impl Eapp {
                     let _ = self.write_guest_u32(state_ptr.wrapping_add(i * 4), value);
                 }
             }
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.mvp = None;
+            }
             info!(
                 target: "EAPP_GL",
-                "ordinal_165: PR #3 glLoadIdentity state_ptr={:#010x}",
+                "ordinal_165: glLoadIdentity state_ptr={:#010x}",
                 state_ptr
             );
             return;
@@ -4442,6 +4539,25 @@ impl Eapp {
                 }
             }
         }
+    }
+
+    /// Ordinal 166: glLoadIdentity fixed-point (16.16).
+    fn live_handle_ordinal_166(&mut self, args: [u32; 4]) {
+        let state_ptr = args[0];
+        if state_ptr != 0 {
+            for i in 0..16u32 {
+                let value = if i % 5 == 0 { 0x1_0000 } else { 0 };
+                let _ = self.write_guest_u32(state_ptr.wrapping_add(i * 4), value);
+            }
+        }
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.mvp = None;
+        }
+        info!(
+            target: "EAPP_GL",
+            "ordinal_166: glLoadIdentity fixed state_ptr={:#010x}",
+            state_ptr
+        );
     }
 
     /// Vortex (12345) surface container fix.
@@ -6215,6 +6331,27 @@ impl Eapp {
     fn live_log_draw_record(&mut self, record: &live_gl::LiveDrawRecord) {
         let handle = record.handle;
         let draw_index = record.draw_index;
+        if let Some(reason) = record.skipped_reason.clone() {
+            if let Some(lg) = self.live_gl.as_mut() {
+                lg.note_skipped_draw(reason.clone());
+            }
+            let key = (handle, reason.clone());
+            if self.skipped_draw_warnings.insert(key) {
+                warn!(
+                    target: "EAPP_GL",
+                    "draw{} skipped: {} handle={:#x} (first occurrence; further same-reason skips suppressed)",
+                    draw_index + 1,
+                    reason,
+                    handle
+                );
+            }
+            return;
+        }
+
+        if !log_enabled!(target: "EAPP_GL", log::Level::Info) {
+            return;
+        }
+
         let quad_dump_frame = fliwheel_var_os("GL_QUAD_DUMP_FRAME")
             .and_then(|value| value.to_string_lossy().parse::<u64>().ok());
         let quad_dump_handle = fliwheel_var_os("GL_QUAD_DUMP_HANDLE").and_then(|value| {
@@ -6673,8 +6810,10 @@ impl Eapp {
         };
         let mut frame = self.render_state.lock().unwrap();
         for (dst, src) in frame.iter_mut().zip(presented.iter()) {
-            *dst = ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
+            *dst = 0xff00_0000 | ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
         }
+        drop(frame);
+        self.frame_seq.fetch_add(1, Ordering::Release);
     }
 
     /// Print a bounded structural comparison between the live candidate and
@@ -6782,8 +6921,10 @@ impl Eapp {
         };
         let mut frame = self.render_state.lock().unwrap();
         for (dst, src) in frame.iter_mut().zip(presented.iter()) {
-            *dst = ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
+            *dst = 0xff00_0000 | ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
         }
+        drop(frame);
+        self.frame_seq.fetch_add(1, Ordering::Release);
         info!(target: "EAPP_GL", "gate_b presented live framebuffer to eapp window");
     }
 
@@ -6940,11 +7081,12 @@ impl Eapp {
                 }
                 let vortex_direct = self.metadata.title == "12345"
                     && fliwheel_var_os("VORTEX_PR3_GL165").is_some();
-                let holdem_direct = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |path| path.contains("33333"));
+                let holdem_direct = self.metadata.title == "33333"
+                    || self
+                        .metadata
+                        .bundle_dir
+                        .to_str()
+                        .map_or(false, |path| path.contains("33333"));
                 let button_bits = match self.metadata.title.as_str() {
                     "55555" => {
                         // Bejeweled uses the four clickwheel quadrants as a
@@ -6977,19 +7119,23 @@ impl Eapp {
                     }
                     _ => Self::input_state_bits(&state),
                 };
-                let wheel_bits = if matches!(self.metadata.title.as_str(), "1B200" | "12345") {
+                let wheel_bits = if self.metadata.title == "1B200" {
+                    if let Some(bits) = self.lost_touch_bits(&state) {
+                        bits
+                    } else {
+                        self.lost_wheel_poll_bits(state.wheel_delta)
+                    }
+                } else if self.metadata.title == "12345" {
                     self.lost_wheel_poll_bits(state.wheel_delta)
                 } else if holdem_direct {
                     self.holdem_wheel_poll_bits(state.wheel_delta)
                 } else {
                     self.wheel_input_bits(state.wheel_delta)
                 };
-                let event_state = if self.metadata.title == "55555" {
-                    // In Bejeweled the directional keys represent a
-                    // clickwheel touch quadrant. Do not also expose them as
-                    // ordinary linked button events, or the shared event
-                    // consumer moves the selection before the touch handler
-                    // can perform the swap.
+                let event_state = if matches!(self.metadata.title.as_str(), "55555" | "1B200") {
+                    // In Bejeweled and Lost, directional keys represent clickwheel touch quadrants
+                    // (gem swap in Bejeweled, walking in Lost). Do not also expose them as
+                    // ordinary linked button events.
                     let mut event_state = state.clone();
                     event_state.up = false;
                     event_state.down = false;
@@ -7231,23 +7377,57 @@ impl Eapp {
         (1 << 30) | Self::lost_wheel_byte(raw) as u32
     }
 
+    /// In LOST (1B200), character movement (walking Jack) is controlled by
+    /// resting a finger on the clickwheel at one of the cardinal angles:
+    /// Right = 0, Top = 64, Left = 128, Bottom = 192 (counter-clockwise byte ring).
+    /// Holding a side reports this fixed touch angle every frame with bit 30 set,
+    /// which allows gameplay and the tutorial ("TOUCH THE LOWER SIDE OF THE WHEEL")
+    /// to progress when pressing physical or virtual directional controls.
+    fn lost_touch_bits(&mut self, state: &EappInputState) -> Option<u32> {
+        let angle = match (state.up, state.down, state.left, state.right) {
+            (true, false, false, false) => Some(64u8),   // Top (Up)
+            (false, true, false, false) => Some(192u8),  // Bottom (Down - Lower side of wheel)
+            (false, false, true, false) => Some(128u8),  // Left
+            (false, false, false, true) => Some(0u8),    // Right
+            (true, false, false, true) => Some(32u8),    // Top-Right
+            (true, false, true, false) => Some(96u8),    // Top-Left
+            (false, true, true, false) => Some(160u8),   // Bottom-Left
+            (false, true, false, true) => Some(224u8),   // Bottom-Right
+            _ => None,
+        };
+        if angle.is_some() {
+            self.lost_wheel_pending.clear();
+        }
+        angle.map(|a| (1 << 30) | a as u32)
+    }
+
     fn lost_wheel_poll_bits(&mut self, delta: f32) -> u32 {
-        // The PR runner queues one absolute sample per raw detent and the
-        // guest consumes one sample per InputEvents poll. Preserve that queue
-        // behavior for both scripted and live relative motion.
-        if delta.is_finite() {
-            self.lost_wheel_remainder += delta;
+        if delta.is_finite() && delta != 0.0 {
+            if (delta > 0.0 && self.lost_wheel_remainder < 0.0)
+                || (delta < 0.0 && self.lost_wheel_remainder > 0.0)
+                || (delta > 0.0 && !self.lost_wheel_pending.is_empty() && self.lost_wheel_last_step < 0)
+                || (delta < 0.0 && !self.lost_wheel_pending.is_empty() && self.lost_wheel_last_step > 0)
+            {
+                self.lost_wheel_pending.clear();
+                self.lost_wheel_remainder = 0.0;
+            }
+            self.lost_wheel_remainder += delta * 4.0;
         }
         let mut added = 0usize;
         while self.lost_wheel_remainder.abs() >= 1.0
             && added < Self::LOST_WHEEL_DETENTS as usize
+            && self.lost_wheel_pending.len() < 16
         {
             let step = if self.lost_wheel_remainder > 0.0 { 1 } else { -1 };
             self.lost_wheel_remainder -= step as f32;
+            self.lost_wheel_last_step = step;
             self.lost_wheel_raw = ((self.lost_wheel_raw as i16 + step)
                 .rem_euclid(Self::LOST_WHEEL_DETENTS)) as u8;
             self.lost_wheel_pending.push_back(self.lost_wheel_raw);
             added += 1;
+        }
+        if self.lost_wheel_pending.len() >= 16 {
+            self.lost_wheel_remainder = 0.0;
         }
         self.lost_wheel_pending
             .pop_front()
@@ -7282,12 +7462,21 @@ impl Eapp {
     }
 
     fn holdem_wheel_poll_bits(&mut self, delta: f32) -> u32 {
-        if delta.is_finite() {
-            self.holdem_wheel_remainder += delta;
+        if delta.is_finite() && delta != 0.0 {
+            if (delta > 0.0 && self.holdem_wheel_remainder < 0.0)
+                || (delta < 0.0 && self.holdem_wheel_remainder > 0.0)
+                || (delta > 0.0 && !self.holdem_wheel_pending.is_empty() && self.holdem_wheel_last_step < 0)
+                || (delta < 0.0 && !self.holdem_wheel_pending.is_empty() && self.holdem_wheel_last_step > 0)
+            {
+                self.holdem_wheel_pending.clear();
+                self.holdem_wheel_remainder = 0.0;
+            }
+            self.holdem_wheel_remainder += delta * 4.0;
         }
         let mut added = 0usize;
         while self.holdem_wheel_remainder.abs() >= 1.0
             && added < Self::HOLDEM_WHEEL_DETENTS as usize
+            && self.holdem_wheel_pending.len() < 16
         {
             let step = if self.holdem_wheel_remainder > 0.0 {
                 1
@@ -7295,10 +7484,14 @@ impl Eapp {
                 -1
             };
             self.holdem_wheel_remainder -= step as f32;
+            self.holdem_wheel_last_step = step;
             self.holdem_wheel_raw = ((self.holdem_wheel_raw as i16 + step)
                 .rem_euclid(Self::HOLDEM_WHEEL_DETENTS)) as u8;
             self.holdem_wheel_pending.push_back(self.holdem_wheel_raw);
             added += 1;
+        }
+        if self.holdem_wheel_pending.len() >= 16 {
+            self.holdem_wheel_remainder = 0.0;
         }
         self.holdem_wheel_pending
             .pop_front()
@@ -8069,42 +8262,22 @@ impl Eapp {
             let complete = fliwheel_var("EAPP_ASYNC3_COMPLETE")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false);
-            let is_tetris = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("66666"));
-            let is_texas = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("33333"));
-            let is_sudoku = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("50513"));
-            let is_sims = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
-            let is_royal = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("50514"));
-            let is_mspacman = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("14004"));
-            let is_lost = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("1B200"));
-            let is_vortex = self.metadata.title == "12345";
+            let is_tetris = self.metadata.title == "66666"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
+            let is_texas = self.metadata.title == "33333"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
+            let is_sudoku = self.metadata.title == "50513"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
+            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
+            let is_royal = self.metadata.title == "50514"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
+            let is_mspacman = self.metadata.title == "14004"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
+            let is_lost = self.metadata.title == "1B200"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
+            let is_vortex = self.metadata.title == "12345"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
             let owner = args[0];
             let req = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
             let req_cb = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0);
@@ -8425,43 +8598,24 @@ impl Eapp {
             let complete = fliwheel_var("EAPP_ASYNC3_COMPLETE")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false);
-            let is_tetris = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("66666"));
-            let is_texas = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("33333"));
-            let is_sudoku = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("50513"));
-            let is_sims = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
-            let is_royal = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("50514"));
-            let is_mspacman = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("14004"));
-            let is_lost = self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("1B200"));
-            let is_mahjong = self.metadata.title == "77777";
-            let is_vortex = self.metadata.title == "12345";
+            let is_tetris = self.metadata.title == "66666"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
+            let is_texas = self.metadata.title == "33333"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
+            let is_sudoku = self.metadata.title == "50513"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
+            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
+            let is_royal = self.metadata.title == "50514"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
+            let is_mspacman = self.metadata.title == "14004"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
+            let is_lost = self.metadata.title == "1B200"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
+            let is_mahjong = self.metadata.title == "77777"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
+            let is_vortex = self.metadata.title == "12345"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
             let owner = args[0];
             let callback_pc = self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0);
             let callback_ctx = self.read_guest_u32(owner.wrapping_add(0x38)).unwrap_or(0);
@@ -8972,7 +9126,6 @@ impl Eapp {
             .or_else(|| self.try_read_c_string(args[1], 256));
         if let Some(path) = path {
             info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path={}", ordinal, path);
-            self.fill_framebuffer(HLE_INFO_FRAMEBUFFER);
 
             if ordinal == 12 {
                 // Direct open-like call used by wrapper 0x6068:
@@ -9017,43 +9170,24 @@ impl Eapp {
                 // callback before the render loop can advance to the next
                 // asynchronous asset.
                 let owner = args[3];
-                let is_lost = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("1B200"));
-                let is_tetris = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("66666"));
-                let is_texas = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("33333"));
-                let is_sudoku = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("50513"));
-                let is_sims = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
-                let is_royal = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("50514"));
-                let is_mspacman = self
-                    .metadata
-                    .bundle_dir
-                    .to_str()
-                    .map_or(false, |p| p.contains("14004"));
-                let is_mahjong = self.metadata.title == "77777";
-                let is_vortex = self.metadata.title == "12345";
+                let is_lost = self.metadata.title == "1B200"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
+                let is_tetris = self.metadata.title == "66666"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
+                let is_texas = self.metadata.title == "33333"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
+                let is_sudoku = self.metadata.title == "50513"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
+                let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
+                let is_royal = self.metadata.title == "50514"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
+                let is_mspacman = self.metadata.title == "14004"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
+                let is_mahjong = self.metadata.title == "77777"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
+                let is_vortex = self.metadata.title == "12345"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
                 let tetris_complete = is_tetris
                     && fliwheel_var("EAPP_ASYNC3_COMPLETE")
                         .map(|v| v == "1" || v == "true")
@@ -9573,11 +9707,12 @@ impl Eapp {
                                 bytes.len()
                             };
                             let n = bytes.len().min(requested_len);
-                            let is_sims = self
-                                .metadata
-                                .bundle_dir
-                                .to_str()
-                                .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
+                            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+                                || self
+                                    .metadata
+                                    .bundle_dir
+                                    .to_str()
+                                    .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
                             let zero_fill_sims_rserver = is_sims
                                 && fliwheel_var_os("EAPP_SIMS_ZERO_FILL_RSERVER").is_some()
                                 && host_path
@@ -9641,30 +9776,18 @@ impl Eapp {
                                 // reversed; default stays at 0 (golden). Set
                                 // FLIWHEEL_EAPP_ASYNC3_COMPLETE=1 to re-enable
                                 // the iteration-10 behavior for RE.
-                                let is_tetris = self
-                                    .metadata
-                                    .bundle_dir
-                                    .to_str()
-                                    .map_or(false, |p| p.contains("66666"));
-                                let is_texas = self
-                                    .metadata
-                                    .bundle_dir
-                                    .to_str()
-                                    .map_or(false, |p| p.contains("33333"));
-                                let is_popcap =
-                                    self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                                        p.contains("44444") || p.contains("55555")
+                                let is_tetris = self.metadata.title == "66666"
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
+                                let is_texas = self.metadata.title == "33333"
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
+                                let is_popcap = matches!(self.metadata.title.as_str(), "44444" | "55555" | "99999")
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
+                                        p.contains("44444") || p.contains("55555") || p.contains("99999")
                                     });
-                                let is_mspacman = self
-                                    .metadata
-                                    .bundle_dir
-                                    .to_str()
-                                    .map_or(false, |p| p.contains("14004"));
-                                let is_pacman = self
-                                    .metadata
-                                    .bundle_dir
-                                    .to_str()
-                                    .map_or(false, |p| p.contains("AAAAA"));
+                                let is_mspacman = self.metadata.title == "14004"
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
+                                let is_pacman = self.metadata.title == "AAAAA"
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("AAAAA"));
                                 let tetris_complete = is_tetris
                                     && fliwheel_var("EAPP_ASYNC3_COMPLETE")
                                         .map(|v| v == "1" || v == "true")
@@ -10311,11 +10434,12 @@ impl Eapp {
     /// default execution remains unchanged while the next scene contract is
     /// investigated.
     fn maybe_apply_sims_input_ready(&mut self) {
-        let is_sims = self
-            .metadata
-            .bundle_dir
-            .to_str()
-            .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
+        let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+            || self
+                .metadata
+                .bundle_dir
+                .to_str()
+                .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
         let enabled = is_sims
             && fliwheel_var("EAPP_SIMS_INPUT_READY")
                 .map(|v| v == "1" || v == "true")
@@ -10430,6 +10554,8 @@ impl Eapp {
     fn fill_framebuffer(&mut self, color: u32) {
         let mut frame = self.render_state.lock().unwrap();
         frame.fill(color);
+        drop(frame);
+        self.frame_seq.fetch_add(1, Ordering::Release);
     }
 
     fn handle_bootstrap_return(&mut self) {
@@ -10814,11 +10940,7 @@ impl Eapp {
     }
 
     fn observe_audio_guest_pc(&mut self, pc: u32) {
-        // The current resource-indexed wrapper contract is proven only for
-        // Tetris (66666). Other games place unrelated code at these same
-        // virtual addresses and would otherwise produce fabricated audio
-        // events with pointer values interpreted as resource IDs.
-        if self.metadata.title != "66666" {
+        if !self.is_tetris || (pc != 0x1800_5498 && pc != 0x1800_3eb8) {
             return;
         }
         match pc {
@@ -11201,7 +11323,7 @@ impl Eapp {
     /// first few hits for each PC, enough to identify which suspected routines
     /// run on the default path and what guest pointers/status fields they see.
     fn maybe_trace_string_path(&mut self, pc: u32) {
-        if !string_trace_enabled() || !STRING_TRACE_PCS.contains(&pc) {
+        if !self.string_trace_enabled || !STRING_TRACE_PCS.contains(&pc) {
             return;
         }
         let hit_count = {
@@ -11919,7 +12041,7 @@ impl Eapp {
                     regs[0], regs[1], regs[2], regs[3]
                 ));
             }
-            0x1801_95a8 | 0x1801_c940 => {
+            0x1801_95a8 => {
                 // Options/settings or vtable constructor
                 details.push(format!(
                     "MENU_CTOR pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
@@ -11955,7 +12077,7 @@ impl Eapp {
     /// for distinguishing a missing host callback from a guest-side object
     /// contract without changing the default execution path.
     fn maybe_trace_guest_pc(&mut self, pc: u32) {
-        if !self.guest_pc_trace_pcs.contains(&pc) {
+        if self.guest_pc_trace_pcs.is_empty() || !self.guest_pc_trace_pcs.contains(&pc) {
             return;
         }
         let hit = {
@@ -12240,11 +12362,8 @@ impl Eapp {
         info!(target: "EAPP", "request object @ {:#010x}:{}", req, rendered);
     }
 
-    fn handle_guest_svc(&mut self, pc: u32) -> bool {
-        if self.read_guest_u32(pc) != Some(0xef12_3456) {
-            return false;
-        }
-
+    #[inline(always)]
+    fn handle_guest_svc_dispatch(&mut self, pc: u32) {
         let call_num = self.cpu.reg_get(self.cpu.mode(), 0);
         let arg_ptr = self.cpu.reg_get(self.cpu.mode(), 1);
         match call_num {
@@ -12262,17 +12381,10 @@ impl Eapp {
                 self.cpu.reg_set(self.cpu.mode(), 0, 0);
             }
         }
-
-        self.cpu
-            .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
-        true
     }
 
     fn maybe_patch_guest_state(&mut self, pc: u32) {
-        if self.metadata.title != "66666" {
-            return;
-        }
-        if !(0x18013d4c..=0x18014020).contains(&pc) {
+        if !self.is_tetris || !(0x18013d4c..=0x18014020).contains(&pc) {
             return;
         }
 
@@ -13096,12 +13208,30 @@ impl Memory for EappBus {
         }
     }
 
+    #[inline]
     fn x16(&mut self, offset: u32) -> MemResult<u16> {
-        self.r16(offset)
+        match offset {
+            FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
+                self.image.r16(offset - FILE_VMA_BASE)
+            }
+            WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
+                self.work_ram.r16(offset - WORK_RAM_BASE)
+            }
+            _ => self.r16(offset),
+        }
     }
 
+    #[inline]
     fn x32(&mut self, offset: u32) -> MemResult<u32> {
-        self.r32(offset)
+        match offset {
+            FILE_VMA_BASE..=u32::MAX if offset - FILE_VMA_BASE < self.image_len => {
+                self.image.r32(offset - FILE_VMA_BASE)
+            }
+            WORK_RAM_BASE..=u32::MAX if offset - WORK_RAM_BASE < WORK_RAM_SIZE as u32 => {
+                self.work_ram.r32(offset - WORK_RAM_BASE)
+            }
+            _ => self.r32(offset),
+        }
     }
 }
 
@@ -13280,6 +13410,72 @@ fn make_controls(input_state: Arc<Mutex<EappInputState>>) -> EappBinds {
     controls
 }
 
+fn canonicalize_game_title(raw_title: &str, bundle_dir: &Path, exe_path: &Path) -> String {
+    let lower_title = raw_title.to_ascii_lowercase();
+    let lower_dir = bundle_dir.to_string_lossy().to_ascii_lowercase();
+    let lower_exe = exe_path.to_string_lossy().to_ascii_lowercase();
+
+    let matches_game = |keywords: &[&str]| {
+        keywords.iter().any(|k| {
+            lower_title.contains(k) || lower_dir.contains(k) || lower_exe.contains(k)
+        })
+    };
+
+    if matches_game(&["mspacman", "ms. pac-man", "ms_pacman", "ms pac-man", "ms pacman", "14004"]) {
+        return "14004".to_string();
+    }
+    if matches_game(&["pacman", "pac-man", "aaaaa"]) {
+        return "AAAAA".to_string();
+    }
+    if matches_game(&["tetris", "66666"]) {
+        return "66666".to_string();
+    }
+    if matches_game(&["vortex", "12345"]) {
+        return "12345".to_string();
+    }
+    if matches_game(&["holdem", "hold'em", "texas", "33333"]) {
+        return "33333".to_string();
+    }
+    if matches_game(&["zuma", "44444"]) {
+        return "44444".to_string();
+    }
+    if matches_game(&["bejeweled", "55555"]) {
+        return "55555".to_string();
+    }
+    if matches_game(&["mahjong", "77777"]) {
+        return "77777".to_string();
+    }
+    if matches_game(&["cubis", "99999", "peggle"]) {
+        return "99999".to_string();
+    }
+    if matches_game(&["lost", "1b200"]) {
+        return "1B200".to_string();
+    }
+    if matches_game(&["sudoku", "50513"]) {
+        return "50513".to_string();
+    }
+    if matches_game(&["solitaire", "50514"]) {
+        return "50514".to_string();
+    }
+    if matches_game(&["simsbowling", "sims bowling", "bowling", "1500c"]) {
+        return "1500C".to_string();
+    }
+    if matches_game(&["simspool", "sims pool", "pool", "1500e"]) {
+        return "1500E".to_string();
+    }
+    if matches_game(&["minigolf", "mini golf", "88888"]) {
+        return "88888".to_string();
+    }
+    if matches_game(&["iquiz", "11002"]) {
+        return "11002".to_string();
+    }
+    if matches_game(&["musika", "1c300"]) {
+        return "1C300".to_string();
+    }
+
+    raw_title.to_string()
+}
+
 fn find_game_executable(bundle_dir: &Path) -> Result<PathBuf, EappBuildError> {
     let exe_dir = bundle_dir.join("Executables");
     let mut bins = fs::read_dir(&exe_dir)
@@ -13292,7 +13488,7 @@ fn find_game_executable(bundle_dir: &Path) -> Result<PathBuf, EappBuildError> {
                 .and_then(|name| name.to_str())
                 .map(|name| !name.starts_with('.') && !name.starts_with("._"))
                 .unwrap_or(false);
-            name_is_real && path.extension().map(|ext| ext == "bin").unwrap_or(false)
+            name_is_real && path.extension().map(|ext| ext.eq_ignore_ascii_case("bin")).unwrap_or(false)
         })
         .collect::<Vec<_>>();
     bins.sort();
@@ -13732,4 +13928,23 @@ mod tests {
         assert_eq!(matrix[13], -1.0);
         assert_eq!(matrix[15], 1.0);
     }
+
+    #[test]
+    fn holdem_ortho_helper_handles_y_down_projection() {
+        // Texas Hold'em / standard Y-down ortho: left=0, right=320, bottom=240, top=0
+        let matrix = orthographic_matrix(
+            [0x1806_3e7c, 0.0f32.to_bits(), 320.0f32.to_bits(), 240.0f32.to_bits()],
+            0.0,
+            -1.0,
+            1.0,
+        )
+        .unwrap();
+        assert!((matrix[0] - 0.00625).abs() < 1e-6);
+        assert!((matrix[5] + 0.008333334).abs() < 1e-6); // negative Y scale (top above bottom)
+        assert!((matrix[10] + 1.0).abs() < 1e-6);
+        assert_eq!(matrix[12], -1.0);
+        assert_eq!(matrix[13], 1.0);
+        assert_eq!(matrix[15], 1.0);
+    }
 }
+

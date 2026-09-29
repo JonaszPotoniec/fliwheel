@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::gl_decode::{format_from_gl, pix_payload_size};
 use super::rasterizer::{
@@ -127,7 +128,7 @@ pub struct LiveGlUpload {
     pub source_file: Option<String>,
     pub source_file_offset: Option<u32>,
     pub format: Option<TextureFormat>,
-    pub texture: Option<Texture>,
+    pub texture: Option<Arc<Texture>>,
     /// GL texture name this upload is bound to, decoded from the preceding
     /// ordinal-45 descriptor (Tetris/Holdem layout: descriptor word 1).
     /// `None` for uploads captured before ord45-tex-name tracking existed or
@@ -438,7 +439,7 @@ impl LiveGlState {
                 source_file: Some(path.display().to_string()),
                 source_file_offset: None,
                 format: Some(format),
-                texture: Some(texture),
+                texture: Some(Arc::new(texture)),
                 tex_name: Some(name),
             });
             loaded.push(format!(
@@ -488,6 +489,7 @@ impl LiveGlState {
         // so drop the prior frame's recorded pushes+consumption.
         self.text_char_seqs.clear();
         self.text_char_consumed.clear();
+        self.mvp = None;
     }
 
     pub fn set_clear_color(&mut self, color: Rgba8) {
@@ -833,14 +835,14 @@ impl LiveGlState {
             if payload.len() < expected {
                 return None;
             }
-            Some(Texture::from_live_gl_bytes(
+            Some(Arc::new(Texture::from_live_gl_bytes(
                 &payload[..expected],
                 width as usize,
                 height as usize,
                 fmt,
                 // A8 tint: white, matching the offline replay convention.
                 Rgba8::rgba(255, 255, 255, 255),
-            ))
+            )))
         });
         LiveGlUpload {
             index,
@@ -906,7 +908,7 @@ impl LiveGlState {
             upload.source_file = None;
             upload.source_file_offset = None;
             upload.format = Some(TextureFormat::Rgba8888);
-            upload.texture = Some(texture);
+            upload.texture = Some(Arc::new(texture));
             return;
         }
 
@@ -922,7 +924,7 @@ impl LiveGlState {
             source_file: None,
             source_file_offset: None,
             format: Some(TextureFormat::Rgba8888),
-            texture: Some(texture),
+            texture: Some(Arc::new(texture)),
             tex_name: Some(tex_name),
         });
     }
@@ -969,7 +971,7 @@ impl LiveGlState {
             return false;
         };
         let (dest_width, dest_height) = (upload.width, upload.height);
-        let Some(texture) = upload.texture.as_mut() else {
+        let Some(texture) = upload.texture.as_mut().map(Arc::make_mut) else {
             return false;
         };
         for row in 0..height.min(dest_height.saturating_sub(y)) {
@@ -2542,10 +2544,12 @@ mod tests {
             None,
         ));
         lg.translation = (10.0, 20.0);
+        lg.mvp = Some([1.0; 16]);
         lg.draw_count_in_frame = 2;
         lg.framebuffer[0] = Rgba8::rgba(1, 2, 3, 4);
         lg.reset_for_frame();
         assert_eq!(lg.translation, (0.0, 0.0));
+        assert_eq!(lg.mvp, None);
         assert_eq!(lg.draw_count_in_frame, 0);
         assert_eq!(lg.framebuffer[0], Rgba8::rgba(0, 0, 0, 0));
         assert_eq!(lg.uploads.len(), 1, "uploads persist across frames");

@@ -34,6 +34,15 @@ impl Ram {
         let offset = offset as usize;
         data.copy_from_slice(&self.mem[offset..offset + data.len()]);
     }
+
+    #[inline(always)]
+    pub fn read_u32_fast(&self, offset: usize) -> Option<u32> {
+        if offset + 4 <= self.mem.len() {
+            Some(LittleEndian::read_u32(&self.mem[offset..]))
+        } else {
+            None
+        }
+    }
 }
 
 impl Device for Ram {

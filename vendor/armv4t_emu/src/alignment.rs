@@ -11,16 +11,19 @@ impl<T: Memory> AlignmentWrapper<'_, T> {
 }
 
 impl<T: Memory> Memory for AlignmentWrapper<'_, T> {
+    #[inline(always)]
     fn r8(&mut self, addr: u32) -> u8 {
         // TODO: fixme
         self.0.r8(addr)
     }
 
+    #[inline(always)]
     fn r16(&mut self, addr: u32) -> u16 {
         // TODO: fixme
         self.0.r16(addr)
     }
 
+    #[inline(always)]
     fn r32(&mut self, addr: u32) -> u32 {
         let a = addr & !3;
 
@@ -33,17 +36,30 @@ impl<T: Memory> Memory for AlignmentWrapper<'_, T> {
         }
     }
 
+    #[inline(always)]
     fn w8(&mut self, addr: u32, val: u8) {
         // TODO: fixme
         self.0.w8(addr, val)
     }
 
+    #[inline(always)]
     fn w16(&mut self, addr: u32, val: u16) {
         // TODO: fixme
         self.0.w16(addr, val)
     }
 
+    #[inline(always)]
     fn w32(&mut self, addr: u32, val: u32) {
         self.0.w32(addr & !3, val);
+    }
+
+    #[inline(always)]
+    fn x16(&mut self, addr: u32) -> u16 {
+        self.0.x16(addr & !1)
+    }
+
+    #[inline(always)]
+    fn x32(&mut self, addr: u32) -> u32 {
+        self.0.x32(addr & !3)
     }
 }

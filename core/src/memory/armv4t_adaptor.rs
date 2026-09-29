@@ -28,6 +28,7 @@ impl<'a, M: Memory> MemoryAdapter<'a, M> {
 
 macro_rules! impl_memadapter_r {
     ($fn:ident, $ret:ty) => {
+        #[inline(always)]
         fn $fn(&mut self, addr: u32) -> $ret {
             use crate::memory::MemAccessKind;
             match self.mem.$fn(addr) {
@@ -53,6 +54,7 @@ macro_rules! impl_memadapter_r {
 
 macro_rules! impl_memadapter_w {
     ($fn:ident, $val:ty) => {
+        #[inline(always)]
         fn $fn(&mut self, addr: u32, val: $val) {
             use crate::memory::MemAccessKind;
             match self.mem.$fn(addr, val) {
@@ -68,6 +70,7 @@ macro_rules! impl_memadapter_w {
 
 macro_rules! impl_memadapter_x {
     ($fn:ident, $ret:ty) => {
+        #[inline(always)]
         fn $fn(&mut self, addr: u32) -> $ret {
             use crate::memory::MemAccessKind;
             match self.mem.$fn(addr) {

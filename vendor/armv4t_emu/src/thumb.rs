@@ -31,6 +31,7 @@ enum Instruction {
     Undefined,
 }
 
+#[allow(dead_code)]
 const INST_MATCH_ORDER: [Instruction; 20] = [
     Instruction::Branch,
     Instruction::AddSub,
@@ -55,6 +56,7 @@ const INST_MATCH_ORDER: [Instruction; 20] = [
 ];
 
 impl Instruction {
+    #[allow(dead_code)]
     #[inline]
     #[rustfmt::skip]
     fn pattern(self) -> (u16, u16) {
@@ -83,14 +85,69 @@ impl Instruction {
         }
     }
 
+    #[inline]
     fn decode(inst: u16) -> Instruction {
-        for typ in INST_MATCH_ORDER.iter() {
-            let (mask, test) = typ.pattern();
-            if (inst as u32).mask_match(mask as u32, test as u32) {
-                return *typ;
+        match (inst >> 13) & 7 {
+            0 => {
+                if (inst & 0xf800) == 0x1800 {
+                    Instruction::AddSub
+                } else {
+                    Instruction::Shifted
+                }
             }
+            1 => Instruction::ImmOp,
+            2 => {
+                if (inst & 0xfc00) == 0x4000 {
+                    Instruction::AluOp
+                } else if (inst & 0xfc00) == 0x4400 {
+                    Instruction::HiRegBx
+                } else if (inst & 0xf800) == 0x4800 {
+                    Instruction::PcLoad
+                } else if (inst & 0xf200) == 0x5000 {
+                    Instruction::SingleXferR
+                } else if (inst & 0xf200) == 0x5200 {
+                    Instruction::HwSgnXfer
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            3 => Instruction::SingleXferI,
+            4 => Instruction::HwXferI,
+            5 => {
+                if (inst & 0xf000) == 0xa000 {
+                    Instruction::LoadAddr
+                } else if (inst & 0xf000) == 0x9000 {
+                    Instruction::SpXfer
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            6 => {
+                if (inst & 0xf000) == 0xc000 {
+                    Instruction::BlockXfer
+                } else if (inst & 0xff00) == 0xb000 {
+                    Instruction::SpAdd
+                } else if (inst & 0xf600) == 0xb400 {
+                    Instruction::PushPop
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            7 => {
+                if (inst & 0xf000) == 0xf000 {
+                    Instruction::LongBranch
+                } else if (inst & 0xf800) == 0xe000 {
+                    Instruction::Branch
+                } else if (inst & 0xff00) == 0xdf00 {
+                    Instruction::SoftwareInt
+                } else if (inst & 0xf000) == 0xd000 {
+                    Instruction::CondBranch
+                } else {
+                    Instruction::Undefined
+                }
+            }
+            _ => unreachable!(),
         }
-        Instruction::Undefined
     }
 }
 
@@ -106,7 +163,7 @@ impl Cpu {
         let v = cpsr.get_bit(cpsr::V);
 
         #[cfg(not(feature = "advanced_disasm"))]
-        {
+        if log_enabled!(log::Level::Trace) {
             trace!("THM: pc: {:#010x}, inst: {:#06x}", pc, inst);
             trace!("Instruction: {:?}", inst_type);
         }
@@ -132,8 +189,8 @@ impl Cpu {
                 let new_n = u32::is_neg($res) as u32;
                 let new_flags = build_flags($new_v, $new_c, new_z, new_n);
                 self.reg[reg::CPSR] = self.reg[reg::CPSR].set_bit(28, 4, new_flags);
-            };
-        };
+            }
+        }
 
         use self::Instruction::*;
         match inst_type {
