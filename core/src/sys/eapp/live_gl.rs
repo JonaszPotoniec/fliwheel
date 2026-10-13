@@ -209,6 +209,9 @@ pub struct LiveGlState {
     /// `glTexImage2D` so its upload can be associated with the GL texture
     /// name later bound by ordinal 159 at draw time.
     pub pending_tex_name: Option<u32>,
+    /// Pointer to the descriptor passed to ordinal 45, stored so that ordinal 99
+    /// can lazily read the texture name if the guest populated it after ordinal 45 returned.
+    pub pending_ord45_desc_ptr: Option<u32>,
     /// GL texture name from the most recent OpenGLES:4 bind. Unlike
     /// `pending_tex_name`, this remains live after an upload and identifies
     /// the texture sampled by subsequent draws.
@@ -334,6 +337,7 @@ impl LiveGlState {
             uploads: Vec::new(),
             resource_uploads_by_handle: HashMap::new(),
             pending_tex_name: None,
+            pending_ord45_desc_ptr: None,
             bound_tex_name: None,
             arrays: HashMap::new(),
             enabled_arrays: HashSet::new(),
@@ -474,11 +478,12 @@ impl LiveGlState {
         self.pointer_text_carry_handle = None;
         self.pointer_text_carry = (0.0, 0.0);
         // Most titles redraw a complete scene every frame. Tetris instead
-        // submits only changed cells after its initial board composition, and
-        // Vortex's transition/menu frames overlay partial scenes without
-        // issuing a clear. Those GL surfaces must retain prior pixels until
+        // submits only changed cells after its initial board composition, Vortex's
+        // transition/menu frames overlay partial scenes without issuing a clear,
+        // and SAT Prep (11050/11051/11052) only redraws cursor/status bar updates
+        // during idle menu input. Those GL surfaces must retain prior pixels until
         // the guest explicitly clears them.
-        if !matches!(self.game_id.as_str(), "66666" | "12345") {
+        if !matches!(self.game_id.as_str(), "66666" | "12345" | "11050" | "11051" | "11052") {
             self.framebuffer = vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS];
         }
         self.draws.clear();
@@ -878,7 +883,7 @@ impl LiveGlState {
 
         let mut pixels = Vec::with_capacity(width.saturating_mul(height));
         for row in 0..height {
-            let source_y = FB_HEIGHT as i64 - 1 - (y + row as i64);
+            let source_y = y + row as i64;
             for col in 0..width {
                 let source_x = x + col as i64;
                 if source_x < 0
@@ -1830,10 +1835,10 @@ mod tests {
     }
 
     #[test]
-    fn copy_framebuffer_updates_bound_texture_in_gl_row_order() {
+    fn copy_framebuffer_updates_bound_texture_in_row_order() {
         let mut lg = LiveGlState::new(false, false, false, "test".to_string());
-        lg.framebuffer[(FB_HEIGHT - 1) * FB_WIDTH] = Rgba8::rgba(1, 2, 3, 255);
-        lg.framebuffer[(FB_HEIGHT - 2) * FB_WIDTH] = Rgba8::rgba(4, 5, 6, 255);
+        lg.framebuffer[0] = Rgba8::rgba(1, 2, 3, 255);
+        lg.framebuffer[FB_WIDTH] = Rgba8::rgba(4, 5, 6, 255);
         lg.uploads.push(LiveGlState::build_upload(
             0,
             0x0de1,

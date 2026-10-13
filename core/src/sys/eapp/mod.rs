@@ -361,8 +361,16 @@ const HLE_WARN_FRAMEBUFFER: u32 = 0xff604020;
 const HLE_OPENGL_FRAMEBUFFER: u32 = 0xff205020;
 const GL_TEXTURE_2D: u32 = 0x0de1;
 const GL_TEXTURE_RECTANGLE: u32 = 0x84f5;
+const GL_PALETTE4_RGB8_OES: u32 = 0x8b90;
+const GL_PALETTE4_RGBA8_OES: u32 = 0x8b91;
+const GL_PALETTE4_R5_G6_B5_OES: u32 = 0x8b92;
+const GL_PALETTE4_RGBA4_OES: u32 = 0x8b93;
+const GL_PALETTE4_RGB5_A1_OES: u32 = 0x8b94;
+const GL_PALETTE8_RGB8_OES: u32 = 0x8b95;
 const GL_PALETTE8_RGBA8_OES: u32 = 0x8b96;
 const GL_PALETTE8_R5_G6_B5_OES: u32 = 0x8b97;
+const GL_PALETTE8_RGBA4_OES: u32 = 0x8b98;
+const GL_PALETTE8_RGB5_A1_OES: u32 = 0x8b99;
 
 fn ordinal45_resource_format(format: u32) -> Option<TextureFormat> {
     match format {
@@ -377,59 +385,114 @@ fn ordinal45_resource_format(format: u32) -> Option<TextureFormat> {
     }
 }
 
-fn palette8_entry_size(format: u32) -> Option<usize> {
+fn paletted_format_info(format: u32) -> Option<(usize, usize)> {
     match format {
-        GL_PALETTE8_RGBA8_OES => Some(4),
-        GL_PALETTE8_R5_G6_B5_OES => Some(2),
+        GL_PALETTE4_RGB8_OES => Some((16, 3)),
+        GL_PALETTE4_RGBA8_OES => Some((16, 4)),
+        GL_PALETTE4_R5_G6_B5_OES => Some((16, 2)),
+        GL_PALETTE4_RGBA4_OES => Some((16, 2)),
+        GL_PALETTE4_RGB5_A1_OES => Some((16, 2)),
+        GL_PALETTE8_RGB8_OES => Some((256, 3)),
+        GL_PALETTE8_RGBA8_OES => Some((256, 4)),
+        GL_PALETTE8_R5_G6_B5_OES => Some((256, 2)),
+        GL_PALETTE8_RGBA4_OES => Some((256, 2)),
+        GL_PALETTE8_RGB5_A1_OES => Some((256, 2)),
         _ => None,
     }
 }
 
-fn decode_palette8(raw: &[u8], width: usize, height: usize, format: u32) -> Option<Vec<Rgba8>> {
+fn decode_paletted(raw: &[u8], width: usize, height: usize, format: u32) -> Option<Vec<Rgba8>> {
+    let (num_entries, entry_size) = paletted_format_info(format)?;
     let pixel_count = width.checked_mul(height)?;
-    let entry_size = palette8_entry_size(format)?;
-    let expected = 256usize.checked_mul(entry_size)?.checked_add(pixel_count)?;
+    let palette_bytes = num_entries.checked_mul(entry_size)?;
+    let data_bytes = if num_entries == 16 {
+        pixel_count.checked_add(1)? / 2
+    } else {
+        pixel_count
+    };
+    let expected = palette_bytes.checked_add(data_bytes)?;
     if raw.len() < expected {
         return None;
     }
 
-    let palette = &raw[..entry_size * 256];
-    Some(
-        (0..pixel_count)
-            .map(|pixel| {
-                let index = raw[entry_size * 256 + pixel] as usize;
-                let base = index * entry_size;
-                match format {
-                    GL_PALETTE8_RGBA8_OES => Rgba8::rgba(
-                        palette[base],
-                        palette[base + 1],
-                        palette[base + 2],
-                        palette[base + 3],
-                    ),
-                    // The iPod's palette entries are little-endian RGB565, as in
-                    // the PR #3 runner. These episode frames are opaque.
-                    GL_PALETTE8_R5_G6_B5_OES => {
-                        let value = u16::from_le_bytes([palette[base], palette[base + 1]]);
-                        let red = (value >> 11) & 0x1f;
-                        let green = (value >> 5) & 0x3f;
-                        let blue = value & 0x1f;
-                        Rgba8::rgba(
-                            ((red * 255 + 15) / 31) as u8,
-                            ((green * 255 + 31) / 63) as u8,
-                            ((blue * 255 + 15) / 31) as u8,
-                            255,
-                        )
-                    }
-                    _ => unreachable!("palette format validated above"),
-                }
-            })
-            .collect(),
-    )
+    let palette_slice = &raw[..palette_bytes];
+    let mut palette_table = Vec::with_capacity(num_entries);
+    for i in 0..num_entries {
+        let base = i * entry_size;
+        let color = match format {
+            GL_PALETTE4_RGBA8_OES | GL_PALETTE8_RGBA8_OES => Rgba8::rgba(
+                palette_slice[base],
+                palette_slice[base + 1],
+                palette_slice[base + 2],
+                palette_slice[base + 3],
+            ),
+            GL_PALETTE4_RGB8_OES | GL_PALETTE8_RGB8_OES => Rgba8::rgba(
+                palette_slice[base],
+                palette_slice[base + 1],
+                palette_slice[base + 2],
+                255,
+            ),
+            GL_PALETTE4_R5_G6_B5_OES | GL_PALETTE8_R5_G6_B5_OES => {
+                let value = u16::from_le_bytes([palette_slice[base], palette_slice[base + 1]]);
+                let red = (value >> 11) & 0x1f;
+                let green = (value >> 5) & 0x3f;
+                let blue = value & 0x1f;
+                Rgba8::rgba(
+                    ((red * 255 + 15) / 31) as u8,
+                    ((green * 255 + 31) / 63) as u8,
+                    ((blue * 255 + 15) / 31) as u8,
+                    255,
+                )
+            }
+            GL_PALETTE4_RGBA4_OES | GL_PALETTE8_RGBA4_OES => {
+                let value = u16::from_le_bytes([palette_slice[base], palette_slice[base + 1]]);
+                let red = ((value >> 12) & 0xf) as u8;
+                let green = ((value >> 8) & 0xf) as u8;
+                let blue = ((value >> 4) & 0xf) as u8;
+                let alpha = (value & 0xf) as u8;
+                Rgba8::rgba(red * 17, green * 17, blue * 17, alpha * 17)
+            }
+            GL_PALETTE4_RGB5_A1_OES | GL_PALETTE8_RGB5_A1_OES => {
+                let value = u16::from_le_bytes([palette_slice[base], palette_slice[base + 1]]);
+                let red = (value >> 11) & 0x1f;
+                let green = (value >> 6) & 0x1f;
+                let blue = (value >> 1) & 0x1f;
+                let alpha = if (value & 1) != 0 { 255 } else { 0 };
+                Rgba8::rgba(
+                    ((red * 255 + 15) / 31) as u8,
+                    ((green * 255 + 15) / 31) as u8,
+                    ((blue * 255 + 15) / 31) as u8,
+                    alpha,
+                )
+            }
+            _ => unreachable!("palette format validated above"),
+        };
+        palette_table.push(color);
+    }
+
+    let mut pixels = Vec::with_capacity(pixel_count);
+    if num_entries == 16 {
+        for p in 0..pixel_count {
+            let byte = raw[palette_bytes + p / 2];
+            let idx = if p % 2 == 0 {
+                (byte >> 4) & 0x0f
+            } else {
+                byte & 0x0f
+            } as usize;
+            pixels.push(palette_table[idx]);
+        }
+    } else {
+        for p in 0..pixel_count {
+            let idx = raw[palette_bytes + p] as usize;
+            pixels.push(palette_table[idx]);
+        }
+    }
+    Some(pixels)
 }
 
-fn is_palette8_compressed_upload_call(args: [u32; 4]) -> bool {
+fn is_paletted_compressed_upload_call(args: [u32; 4]) -> bool {
     matches!(args[0], GL_TEXTURE_2D | GL_TEXTURE_RECTANGLE)
-        && palette8_entry_size(args[2]).is_some()
+        && paletted_format_info(args[2]).is_some()
 }
 
 fn quad_from_slice(pts: &[(f32, f32)]) -> [(f32, f32); 4] {
@@ -792,6 +855,8 @@ pub struct Eapp {
     /// Directory entries from most recent AsyncFileIO:7 directory enumeration.
     /// Stored so the game can query pack names via subsequent calls.
     async_dir_entries: Vec<String>,
+    async_dir_index: usize,
+    async_dir_handle: u32,
     /// Optional inclusive frame window in which to log every OpenGLES call
     /// with full args + return address, for reverse-engineering the GL stream.
     gl_trace_frames: Option<(u64, u64)>,
@@ -1195,6 +1260,8 @@ impl Eapp {
             holdem_sfx_paths: Vec::new(),
             audio_events: Arc::new(Mutex::new(VecDeque::new())),
             async_dir_entries: Vec::new(),
+            async_dir_index: 0,
+            async_dir_handle: 0,
             gl_trace_frames: None,
             gl_capture: None,
             staged_file_generation: 0,
@@ -2024,6 +2091,7 @@ impl Eapp {
         // DMA-only frame present. Throttle to ~every 10K steps to avoid overhead.
         // Only inject if no GL frame is currently active (avoid double-begin).
         self.step_counter += 1;
+        // step_counter updated
         if self.bus.hw_dma_dirty
             && self.live_gl.is_some()
             && self.step_counter % 10000 == 0
@@ -3064,7 +3132,7 @@ impl Eapp {
             // diagnostic fallback for non-texture calls until that alternate
             // ABI is proven.
             19 => {
-                if is_palette8_compressed_upload_call(args) {
+                if is_paletted_compressed_upload_call(args) {
                     self.live_handle_compressed_upload(args);
                 } else {
                     if let Some(program) = self.usse_program.as_ref() {
@@ -3544,6 +3612,9 @@ impl Eapp {
                     desc_ptr, w0, w1, w2, w3, w4, w5, is_small_handle, is_gl_format, prep_width, prep_height);
             }
         }
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.pending_ord45_desc_ptr = Some(desc_ptr);
+        }
         // Early return for ordinal-45 calls that have no proper width/height
         // (TWA/iQuiz style: just set up texture handles, no bulk upload).
         if prep_width == 0 || prep_height == 0 {
@@ -3676,9 +3747,24 @@ impl Eapp {
     /// is preserved exactly as uploaded.
     fn live_handle_upload(&mut self, args: [u32; 4]) {
         let target = args[0];
-        let width = args[3];
         let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
-        let height = self.read_guest_u32(sp).unwrap_or(0);
+        let sp0 = self.read_guest_u32(sp).unwrap_or(0);
+        let (width, height) = if args[3] == 0
+            && matches!(
+                self.metadata.title.as_str(),
+                "11050" | "11051" | "11052"
+            )
+        {
+            let w_mem = self.read_guest_u32(0x180f_f6f0).unwrap_or(0);
+            let h_mem = self.read_guest_u32(0x180f_f6f4).unwrap_or(0);
+            if w_mem > 0 && h_mem > 0 {
+                (w_mem, h_mem)
+            } else {
+                (args[3], sp0)
+            }
+        } else {
+            (args[3], sp0)
+        };
         let source_format = self.read_guest_u32(sp.wrapping_add(0x08)).unwrap_or(0);
         let pixel_type = self.read_guest_u32(sp.wrapping_add(0x0c)).unwrap_or(0);
         let source_ptr = self.read_guest_u32(sp.wrapping_add(0x10)).unwrap_or(0);
@@ -3718,7 +3804,21 @@ impl Eapp {
         let tex_name = self
             .live_gl
             .as_mut()
-            .and_then(|l| l.pending_tex_name.take());
+            .and_then(|l| l.pending_tex_name.take())
+            .or_else(|| {
+                let desc_ptr = self.live_gl.as_ref()?.pending_ord45_desc_ptr?;
+                let w1 = self.read_guest_u32(desc_ptr.wrapping_add(4)).unwrap_or(0);
+                if w1 != 0 && w1 < WORK_RAM_BASE {
+                    Some(w1)
+                } else {
+                    let w0 = self.read_guest_u32(desc_ptr).unwrap_or(0);
+                    if w0 != 0 && w0 < WORK_RAM_BASE {
+                        Some(w0)
+                    } else {
+                        None
+                    }
+                }
+            });
         let mut upload = LiveGlState::build_upload(
             index,
             target,
@@ -3785,16 +3885,25 @@ impl Eapp {
             );
             return;
         }
-        let Some(entry_size) = palette8_entry_size(args[2]) else {
-            warn!(
-                target: "EAPP_GL",
-                "compressed_upload skipped: unsupported palette format={:#x}",
-                args[2]
-            );
-            return;
+        let (num_entries, entry_size) = match paletted_format_info(args[2]) {
+            Some(info) => info,
+            None => {
+                warn!(
+                    target: "EAPP_GL",
+                    "compressed_upload skipped: unsupported palette format={:#x}",
+                    args[2]
+                );
+                return;
+            }
         };
         let pixel_count = width.saturating_mul(height);
-        let expected = entry_size.saturating_mul(256).saturating_add(pixel_count);
+        let data_bytes = if num_entries == 16 {
+            (pixel_count + 1) / 2
+        } else {
+            pixel_count
+        };
+        let palette_bytes = entry_size.saturating_mul(num_entries);
+        let expected = palette_bytes.saturating_add(data_bytes);
         if image_size < expected {
             warn!(
                 target: "EAPP_GL",
@@ -3816,7 +3925,7 @@ impl Eapp {
             );
             return;
         };
-        let Some(pixels) = decode_palette8(&raw, width, height, args[2]) else {
+        let Some(pixels) = decode_paletted(&raw, width, height, args[2]) else {
             warn!(
                 target: "EAPP_GL",
                 "compressed_upload skipped: palette data is shorter than {}x{}",
@@ -7125,7 +7234,7 @@ impl Eapp {
                     } else {
                         self.lost_wheel_poll_bits(state.wheel_delta)
                     }
-                } else if self.metadata.title == "12345" {
+                } else if matches!(self.metadata.title.as_str(), "12345" | "11002" | "11050" | "11051" | "11052") {
                     self.lost_wheel_poll_bits(state.wheel_delta)
                 } else if holdem_direct {
                     self.holdem_wheel_poll_bits(state.wheel_delta)
@@ -7165,11 +7274,11 @@ impl Eapp {
                 };
                 let event_wheel_bits = if vortex_direct && vortex_pressed {
                     self.lost_wheel_event_bits()
-                } else if matches!(self.metadata.title.as_str(), "1B200" | "12345")
+                } else if matches!(self.metadata.title.as_str(), "1B200" | "12345" | "11002" | "11050" | "11051" | "11052")
                     && event_list != 0
                 {
                     // RetailOS queues the current wheel sample alongside every
-                    // LOST/Vortex button press/release. Both games only enter
+                    // LOST/Vortex/iQuiz/SAT button press/release. These games only enter
                     // their linked-event dispatchers after seeing bit 30 from
                     // this poll, so an event node without this packet is
                     // ignored. PR #3's Vortex runner uses raw position zero
@@ -7242,9 +7351,9 @@ impl Eapp {
                 };
                 let input_ctx = if input_obj == r4 { r5 } else { r4 };
                 let reversed_owner = !r4_is_work_ram && r5_is_work_ram;
-                if self.metadata.title == "1B200" && self.app_object != 0 {
-                    // LOST's frame manager keeps the event-list head directly in
-                    // its game-heap context. It does not pass that context in a
+                if matches!(self.metadata.title.as_str(), "1B200" | "11002" | "11050" | "11051" | "11052") && self.app_object != 0 {
+                    // LOST, iQuiz, and SAT Prep frame managers keep the event-list head directly in
+                    // the game-heap app_object. It does not pass that context in a
                     // work-RAM owner register, so the generic owner inference
                     // above otherwise leaves the freshly built list unreachable.
                     self.write_guest_u32(self.app_object.wrapping_add(0x30), event_list);
@@ -8135,6 +8244,39 @@ impl Eapp {
     }
 
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        if ordinal == 9 {
+            let handle = args[0];
+            let buffer = args[1];
+            let max_len = args[2] as usize;
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:9 handle={:#x} buffer={:#010x} max_len={}", handle, buffer, max_len);
+            if self.async_dir_handle != 0 && handle == self.async_dir_handle {
+                if self.async_dir_index < self.async_dir_entries.len() {
+                    let entry_name = self.async_dir_entries[self.async_dir_index].clone();
+                    self.async_dir_index += 1;
+                    let mut bytes = entry_name.as_bytes().to_vec();
+                    bytes.push(0);
+                    let to_write = bytes.len().min(max_len);
+                    let _ = self.write_guest_bytes(buffer, &bytes[..to_write]);
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:9 returned entry '{}' ({}/{})", entry_name, self.async_dir_index, self.async_dir_entries.len());
+                    return 0; // success
+                } else {
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:9 EOF");
+                    return 1; // EOF
+                }
+            }
+            return 1;
+        }
+
+        if ordinal == 10 {
+            let handle = args[0];
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:10 close handle={:#x}", handle);
+            if self.async_dir_handle != 0 && handle == self.async_dir_handle {
+                self.async_dir_handle = 0;
+                self.async_dir_index = 0;
+            }
+            return 0;
+        }
+
         // Direct file-handle read path. Tetris reaches this after a Menu input:
         // wrapper 0x609c calls AsyncFileIO:14(handle, buffer, len) after
         // wrapper 0x6068 opened `prefs.sav` with ordinal 12. Earlier emulation
@@ -8278,6 +8420,12 @@ impl Eapp {
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
             let is_vortex = self.metadata.title == "12345"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
+            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| {
+                    p.contains("11050") || p.contains("11051") || p.contains("11052")
+                });
+            let is_iquiz = self.metadata.title == "11002"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
             let owner = args[0];
             let req = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
             let req_cb = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0);
@@ -8519,6 +8667,43 @@ impl Eapp {
                     owner_internal_cb
                 );
             }
+            if is_sat && owner != 0 && owner_internal_cb != 0 {
+                self.write_guest_u32(owner.wrapping_add(0x20), 0);
+                self.write_guest_u32(owner.wrapping_add(0x24), 0);
+                self.async_callback_queued_count = self.async_callback_queued_count.wrapping_add(1);
+                self.pending_guest_calls.push_back(PendingGuestCall {
+                    pc: owner_internal_cb,
+                    arg0: owner,
+                    arg1: owner_internal_ctx,
+                    arg2: 0,
+                    arg3: 0,
+                });
+                info!(
+                    target: "EAPP_IMPORT",
+                    "AsyncFileIO:1 SAT completion owner={:#010x} cb_pc={:#010x} status=0 bytes=0",
+                    owner,
+                    owner_internal_cb
+                );
+            }
+            if is_iquiz && owner != 0 && owner_internal_cb != 0 {
+                self.write_guest_u32(owner.wrapping_add(0x20), 0);
+                let current_bytes = self.read_guest_u32(owner.wrapping_add(0x24)).unwrap_or(0);
+                self.async_callback_queued_count = self.async_callback_queued_count.wrapping_add(1);
+                self.pending_guest_calls.push_back(PendingGuestCall {
+                    pc: owner_internal_cb,
+                    arg0: owner,
+                    arg1: owner_internal_ctx,
+                    arg2: 0,
+                    arg3: 0,
+                });
+                info!(
+                    target: "EAPP_IMPORT",
+                    "AsyncFileIO:1 iQuiz completion owner={:#010x} cb_pc={:#010x} status=0 bytes={}",
+                    owner,
+                    owner_internal_cb,
+                    current_bytes
+                );
+            }
             if royal_complete && owner != 0 && owner_internal_cb != 0 {
                 let status = fliwheel_var("EAPP_ROYAL_ASYNC1_STATUS")
                     .ok()
@@ -8616,15 +8801,21 @@ impl Eapp {
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
             let is_vortex = self.metadata.title == "12345"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
+            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| {
+                    p.contains("11050") || p.contains("11051") || p.contains("11052")
+                });
+            let is_iquiz = self.metadata.title == "11002"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
             let owner = args[0];
             let callback_pc = self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0);
             let callback_ctx = self.read_guest_u32(owner.wrapping_add(0x38)).unwrap_or(0);
-            if self.metadata.title == "12345" && fliwheel_var_os("EAPP_REQ_DUMP").is_some() {
+            if (self.metadata.title == "12345" || is_sat) && (fliwheel_var_os("EAPP_REQ_DUMP").is_some() || is_sat) {
                 let words = (0..16u32)
                     .map(|index| format!("{:08x}", self.read_guest_u32(owner.wrapping_add(index * 4)).unwrap_or(0)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                info!(target: "EAPP_IMPORT", "AsyncFileIO:2 Vortex req={:#010x} words={}", owner, words);
+                info!(target: "EAPP_IMPORT", "AsyncFileIO:2 req={:#010x} words={}", owner, words);
             }
             let texas_complete = is_texas
                 && env_bool_or_default("EAPP_TEXAS_ASYNC2_COMPLETE", true);
@@ -9004,11 +9195,14 @@ impl Eapp {
             }
             let title_async2_complete =
                 texas_complete
+                    || is_sat
+                    || is_iquiz
                     || sudoku_complete
                     || sims_complete
                     || royal_complete
                     || mspacman_complete;
             if title_async2_complete && owner != 0 && callback_pc != 0 {
+                self.write_guest_u32(owner.wrapping_add(0x20), 0);
                 // Hold'em's resource callback at 0x18004a14 is entered as
                 // (owner, entry). The two pointers are the same object for
                 // this AsyncFileIO:2 wrapper; it compares them and then
@@ -9075,6 +9269,7 @@ impl Eapp {
                                     callback_ctx.wrapping_add(0x14c),
                                     count as u32,
                                 );
+                                self.write_guest_u32(owner.wrapping_add(0x24), count as u32);
                                 info!(
                                     target: "EAPP_IMPORT",
                                     "AsyncFileIO:2 staged read owner={:#010x} entry={:#010x} handle={:#010x} source={:#010x}+{} dest={:#010x} requested={} delivered={} path={}",
@@ -9124,6 +9319,26 @@ impl Eapp {
         let path = self
             .try_read_c_string(args[0], 256)
             .or_else(|| self.try_read_c_string(args[1], 256));
+        if ordinal == 3
+            && path.is_none()
+            && (self.metadata.title == "11002"
+                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002")))
+        {
+            let req = args[2];
+            let callback_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
+            let callback_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:3 iQuiz stream chunk req={:#010x} cb_pc={:#010x}", req, callback_pc);
+            if callback_pc != 0 {
+                self.pending_guest_calls.push_back(PendingGuestCall {
+                    pc: callback_pc,
+                    arg0: req,
+                    arg1: callback_ctx,
+                    arg2: 0,
+                    arg3: 0,
+                });
+            }
+            return 1;
+        }
         if let Some(path) = path {
             info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path={}", ordinal, path);
 
@@ -9188,6 +9403,12 @@ impl Eapp {
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
                 let is_vortex = self.metadata.title == "12345"
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
+                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
+                        p.contains("11050") || p.contains("11051") || p.contains("11052")
+                    });
+                let is_iquiz = self.metadata.title == "11002"
+                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
                 let tetris_complete = is_tetris
                     && fliwheel_var("EAPP_ASYNC3_COMPLETE")
                         .map(|v| v == "1" || v == "true")
@@ -9216,6 +9437,8 @@ impl Eapp {
                         .unwrap_or(false);
                 let complete = is_lost
                     || is_vortex
+                    || is_sat
+                    || is_iquiz
                     || tetris_complete
                     || texas_complete
                     || sudoku_complete
@@ -9389,6 +9612,19 @@ impl Eapp {
                                 "AsyncFileIO:0 Vortex generic open owner={:#010x} handle={:#010x} size={} object={:#010x}",
                                 owner,
                                 vortex_handle.unwrap_or(0),
+                                n,
+                                object
+                            );
+                        }
+                        if is_iquiz {
+                            let object = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
+                            if object != 0 {
+                                self.write_guest_u32(object.wrapping_add(0x08), n);
+                            }
+                            info!(
+                                target: "EAPP_IMPORT",
+                                "AsyncFileIO:0 iQuiz open owner={:#010x} size={} object={:#010x}",
+                                owner,
                                 n,
                                 object
                             );
@@ -9788,6 +10024,12 @@ impl Eapp {
                                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
                                 let is_pacman = self.metadata.title == "AAAAA"
                                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("AAAAA"));
+                                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
+                                        p.contains("11050") || p.contains("11051") || p.contains("11052")
+                                    });
+                                let is_iquiz = self.metadata.title == "11002"
+                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
                                 let tetris_complete = is_tetris
                                     && fliwheel_var("EAPP_ASYNC3_COMPLETE")
                                         .map(|v| v == "1" || v == "true")
@@ -9821,6 +10063,8 @@ impl Eapp {
                                 let complete =
                                     tetris_complete
                                         || texas_complete
+                                        || is_sat
+                                        || is_iquiz
                                         || popcap_resource_read
                                         || mspacman_resource_read
                                         || pacman_texture_read;
@@ -9843,7 +10087,9 @@ impl Eapp {
                                             .ok()
                                             .and_then(|v| v.parse::<u32>().ok())
                                             .unwrap_or(0)
-                                    } else if popcap_resource_read
+                                    } else if is_sat
+                                        || is_iquiz
+                                        || popcap_resource_read
                                         || mspacman_resource_read
                                         || pacman_texture_read
                                     {
@@ -9962,8 +10208,41 @@ impl Eapp {
                     let cb_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
                     let cb_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
 
-                    if let Some(host_path) = self.resolve_or_create_host_path(&path) {
-                        let mut entries = Vec::new();
+                    let is_iquiz_packs = (self.metadata.title == "11002"
+                        || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002")))
+                        && path.to_ascii_lowercase().contains("usertrivia/packs");
+
+                    let mut entries = Vec::new();
+                    if is_iquiz_packs {
+                        for sub_folder in ["UserTrivia/BuiltIn", "UserTrivia/Samples"] {
+                            let p = self.metadata.bundle_dir.join(sub_folder);
+                            if let Ok(read_dir) = fs::read_dir(&p) {
+                                for entry in read_dir.flatten() {
+                                    if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                                        if let Some(name) = entry.file_name().to_str() {
+                                            if !entries.contains(&name.to_string()) {
+                                                entries.push(name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for save_dir in [SAVE_DIR, LEGACY_SAVE_DIR] {
+                            let p = self.metadata.bundle_dir.join(save_dir).join("UserTrivia/Packs");
+                            if let Ok(read_dir) = fs::read_dir(&p) {
+                                for entry in read_dir.flatten() {
+                                    if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                                        if let Some(name) = entry.file_name().to_str() {
+                                            if !entries.contains(&name.to_string()) {
+                                                entries.push(name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(host_path) = self.resolve_or_create_host_path(&path) {
                         if let Ok(read_dir) = fs::read_dir(&host_path) {
                             for entry in read_dir.flatten() {
                                 let full = host_path.join(entry.file_name());
@@ -9976,34 +10255,41 @@ impl Eapp {
                                 }
                             }
                         }
-                        entries.sort();
-                        let count = entries.len();
-
-                        // Store pack names in the EappBus so the game can
-                        // query them later via subsequent AsyncFileIO calls.
-                        self.async_dir_entries = entries.clone();
-
-                        // Set completion status and count in the request object.
-                        // Status 0 = success (matching the \"golden\" ordinal-3 convention).
-                        self.write_guest_u32(req.wrapping_add(0x20), 0); // status = success
-                        self.write_guest_u32(req.wrapping_add(0x24), count as u32); // result = entry count
-
-                        // Queue async completion callback
-                        if cb_pc != 0 {
-                            self.async_callback_queued_count =
-                                self.async_callback_queued_count.wrapping_add(1);
-                            self.pending_guest_calls.push_back(PendingGuestCall {
-                                pc: cb_pc,
-                                arg0: req,
-                                arg1: cb_ctx,
-                                arg2: 0,
-                                arg3: 0,
-                            });
-                        }
-
-                        info!(target: "EAPP_IMPORT", "AsyncFileIO:7 enum {} -> {} entries: {:?} cb_pc={:#010x}", host_path.display(), count, entries, cb_pc);
-                        return 1; // request accepted
+                    } else {
+                        warn!(target: "EAPP_IMPORT", "AsyncFileIO:7 missing host path {}", path);
+                        return 0;
                     }
+
+                    entries.sort();
+                    let count = entries.len();
+
+                    // Store pack names in Eapp so the game can query them
+                    // via subsequent AsyncFileIO:9 calls.
+                    self.async_dir_entries = entries.clone();
+                    self.async_dir_index = 0;
+                    self.async_dir_handle = 0x5041434b; // 'PACK'
+
+                    // Set completion status, count, and directory handle in the request object.
+                    self.write_guest_u32(req.wrapping_add(0x20), 0); // status = success
+                    self.write_guest_u32(req.wrapping_add(0x24), count as u32); // result = entry count
+                    self.write_guest_u32(req.wrapping_add(0x28), count as u32); // count
+                    self.write_guest_u32(req.wrapping_add(0x2c), self.async_dir_handle); // directory handle
+
+                    // Queue async completion callback
+                    if cb_pc != 0 {
+                        self.async_callback_queued_count =
+                            self.async_callback_queued_count.wrapping_add(1);
+                        self.pending_guest_calls.push_back(PendingGuestCall {
+                            pc: cb_pc,
+                            arg0: req,
+                            arg1: cb_ctx,
+                            arg2: 0,
+                            arg3: 0,
+                        });
+                    }
+
+                    info!(target: "EAPP_IMPORT", "AsyncFileIO:7 enum '{}' -> {} entries: {:?} handle={:#x} cb_pc={:#010x}", path, count, entries, self.async_dir_handle, cb_pc);
+                    return 1; // request accepted
                 }
                 warn!(target: "EAPP_IMPORT", "AsyncFileIO:7 missing host path {}", path);
                 return 0;
@@ -12447,11 +12733,49 @@ impl Eapp {
             if resources.exists() {
                 return Some(resources);
             }
+            for lproj_dir in [
+                self.metadata.bundle_dir.join("Localization").join("en.lproj"),
+                self.metadata.bundle_dir.join("UserTrivia").join("Localization").join("en.lproj"),
+                self.metadata.bundle_dir.join("en.lproj"),
+                self.metadata.bundle_dir.join("Data").join("en.lproj"),
+            ] {
+                let lproj_file = lproj_dir.join(candidate);
+                if lproj_file.exists() {
+                    return Some(lproj_file);
+                }
+            }
         }
         for save_dir in [SAVE_DIR, LEGACY_SAVE_DIR] {
             let saved = self.metadata.bundle_dir.join(save_dir).join(normalized);
             if saved.exists() {
                 return Some(saved);
+            }
+        }
+        let is_iquiz = self.metadata.title == "11002"
+            || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+        if is_iquiz {
+            let norm_lower = normalized.to_ascii_lowercase();
+            if let Some(_sub) = norm_lower.strip_prefix("usertrivia/packs/") {
+                let sub_orig = &normalized["usertrivia/packs/".len()..];
+                for save_dir in [SAVE_DIR, LEGACY_SAVE_DIR] {
+                    let saved = self.metadata.bundle_dir.join(save_dir).join("UserTrivia/Packs").join(sub_orig);
+                    if saved.exists() {
+                        return Some(saved);
+                    }
+                }
+                let sample = self.metadata.bundle_dir.join("UserTrivia/Samples").join(sub_orig);
+                if sample.exists() {
+                    return Some(sample);
+                }
+                let builtin = self.metadata.bundle_dir.join("UserTrivia/BuiltIn").join(sub_orig);
+                if builtin.exists() {
+                    return Some(builtin);
+                }
+            } else if norm_lower == "trivia.txt" || norm_lower.ends_with("/trivia.txt") {
+                let builtin = self.metadata.bundle_dir.join("UserTrivia/BuiltIn/movies/trivia.txt");
+                if builtin.exists() {
+                    return Some(builtin);
+                }
             }
         }
         None
@@ -13469,6 +13793,15 @@ fn canonicalize_game_title(raw_title: &str, bundle_dir: &Path, exe_path: &Path) 
     if matches_game(&["iquiz", "11002"]) {
         return "11002".to_string();
     }
+    if matches_game(&["sat reading", "sat-reading", "tpreading", "11050"]) {
+        return "11050".to_string();
+    }
+    if matches_game(&["sat writing", "sat-writing", "tpwriting", "11051"]) {
+        return "11051".to_string();
+    }
+    if matches_game(&["sat math", "sat-math", "sat prep mathematics", "tpmath", "11052"]) {
+        return "11052".to_string();
+    }
     if matches_game(&["musika", "1c300"]) {
         return "1C300".to_string();
     }
@@ -13604,7 +13937,7 @@ fn vma_to_offset(addr: u32) -> Result<u32, EappBuildError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_palette8, is_palette8_compressed_upload_call, live_gl_default_present_vflip,
+        decode_paletted, is_paletted_compressed_upload_call, live_gl_default_present_vflip,
         env_bool_or_default, matrix_helper_transform, orthographic_matrix,
         ordinal45_resource_format, parse_holdem_sfx_bank, parse_vortex_sfx_bank, Eapp,
         EappInputState, GL_IDENTITY_MATRIX, GL_PALETTE8_R5_G6_B5_OES, GL_PALETTE8_RGBA8_OES,
@@ -13699,7 +14032,7 @@ mod tests {
         raw[1024..].copy_from_slice(&[0, 1, 2]);
 
         assert_eq!(
-            decode_palette8(&raw, 3, 1, GL_PALETTE8_RGBA8_OES),
+            decode_paletted(&raw, 3, 1, GL_PALETTE8_RGBA8_OES),
             Some(vec![
                 super::Rgba8::rgba(1, 2, 3, 4),
                 super::Rgba8::rgba(10, 20, 30, 40),
@@ -13711,7 +14044,7 @@ mod tests {
     #[test]
     fn palette8_rgba8_rejects_short_data() {
         assert_eq!(
-            decode_palette8(&[0; 1024], 1, 1, GL_PALETTE8_RGBA8_OES),
+            decode_paletted(&[0; 1024], 1, 1, GL_PALETTE8_RGBA8_OES),
             None
         );
     }
@@ -13726,7 +14059,7 @@ mod tests {
         raw[512..].copy_from_slice(&[0, 1, 2]);
 
         assert_eq!(
-            decode_palette8(&raw, 3, 1, GL_PALETTE8_R5_G6_B5_OES),
+            decode_paletted(&raw, 3, 1, GL_PALETTE8_R5_G6_B5_OES),
             Some(vec![
                 super::Rgba8::rgba(255, 0, 0, 255),
                 super::Rgba8::rgba(0, 255, 0, 255),
@@ -13737,25 +14070,25 @@ mod tests {
 
     #[test]
     fn palette8_compressed_upload_accepts_rectangle_and_2d_targets() {
-        assert!(is_palette8_compressed_upload_call([
+        assert!(is_paletted_compressed_upload_call([
             GL_TEXTURE_2D,
             0,
             GL_PALETTE8_RGBA8_OES,
             1,
         ]));
-        assert!(is_palette8_compressed_upload_call([
+        assert!(is_paletted_compressed_upload_call([
             GL_TEXTURE_RECTANGLE,
             0,
             GL_PALETTE8_RGBA8_OES,
             1,
         ]));
-        assert!(is_palette8_compressed_upload_call([
+        assert!(is_paletted_compressed_upload_call([
             GL_TEXTURE_RECTANGLE,
             0,
             GL_PALETTE8_R5_G6_B5_OES,
             1,
         ]));
-        assert!(!is_palette8_compressed_upload_call([0x84f5, 0, 0x1908, 1]));
+        assert!(!is_paletted_compressed_upload_call([0x84f5, 0, 0x1908, 1]));
     }
 
     #[test]
