@@ -2936,6 +2936,11 @@ impl Eapp {
                     || self.live_is_holdem()
                 {
                     self.live_handle_matrix_op(ordinal, args);
+                } else if ordinal != 175 {
+                    // The screen-space families compose the same helpers
+                    // into their 2D draw transform (Zuma's frog and its aim
+                    // line are rotated this way).
+                    self.live_handle_rotate_scale(ordinal, args);
                 }
                 0
             }
@@ -4186,8 +4191,38 @@ impl Eapp {
         let tx = f32::from_bits(args[1]);
         let ty = f32::from_bits(args[2]);
         if let Some(lg) = self.live_gl.as_mut() {
-            lg.translation.0 += tx;
-            lg.translation.1 += ty;
+            // After a rotation the step is taken in the rotated frame, as
+            // GL's translate does; without one this is the plain sum.
+            let (dx, dy) = live_gl::transform_point(lg.linear, (0.0, 0.0), (tx, ty));
+            lg.translation.0 += dx;
+            lg.translation.1 += dy;
+        }
+    }
+
+    /// Ordinals 173 (rotate: r1=degrees, r2/r3=axis x/y, stack=axis z) and
+    /// 171 (scale: r1/r2=x/y) on the 2D draw transform of the screen-space
+    /// families. Only rotations about the screen normal are 2D; others are
+    /// left out, as before.
+    fn live_handle_rotate_scale(&mut self, ordinal: u32, args: [u32; 4]) {
+        let step = if ordinal == 173 {
+            let (x, y) = (f32::from_bits(args[2]), f32::from_bits(args[3]));
+            let z = self
+                .read_guest_u32(self.cpu.reg_get(self.cpu.mode(), reg::SP))
+                .map(f32::from_bits)
+                .unwrap_or(0.0);
+            if x.abs() > 1e-6 || y.abs() > 1e-6 || z.abs() <= 1e-6 {
+                return;
+            }
+            let (sin, cos) = (f32::from_bits(args[1]) * z.signum()).to_radians().sin_cos();
+            [cos, sin, -sin, cos]
+        } else {
+            [f32::from_bits(args[1]), 0.0, 0.0, f32::from_bits(args[2])]
+        };
+        if !step.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.linear = live_gl::multiply_linear(lg.linear, step);
         }
     }
 
@@ -5686,11 +5721,17 @@ impl Eapp {
             def.stride as usize,
             indices,
         )?;
+        let linear = self.live_linear();
         Some(
             pts.into_iter()
-                .map(|(x, y)| (x + translation.0, y + translation.1))
+                .map(|point| live_gl::transform_point(linear, translation, point))
                 .collect(),
         )
+    }
+
+    /// The rotation/scale part of the 2D draw transform.
+    fn live_linear(&self) -> [f32; 4] {
+        self.live_gl.as_ref().map_or(live_gl::IDENTITY_LINEAR, |lg| lg.linear)
     }
 
     /// Decode position vertices (array 0, GL_FIXED) and apply the current
@@ -5716,9 +5757,10 @@ impl Eapp {
             first,
             count,
         )?;
+        let linear = self.live_linear();
         Some(
             pts.into_iter()
-                .map(|(x, y)| (x + translation.0, y + translation.1))
+                .map(|point| live_gl::transform_point(linear, translation, point))
                 .collect(),
         )
     }
@@ -6586,6 +6628,7 @@ impl Eapp {
             lg.draws.extend(records);
             if !preserve_translation {
                 lg.translation = (0.0, 0.0);
+                lg.linear = live_gl::IDENTITY_LINEAR;
             }
             lg.draw_count_in_frame += increment;
             if lg.continuous_capture {

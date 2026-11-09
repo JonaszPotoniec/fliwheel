@@ -35,6 +35,26 @@ pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
 const NDC_VIEW_MAX_X: f32 = 1.2;
 const NDC_VIEW_MAX_Y: f32 = 0.9;
 
+pub const IDENTITY_LINEAR: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+/// `a · b` for two column-major 2x2 matrices.
+pub fn multiply_linear(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+    ]
+}
+
+/// A vertex through the 2D draw transform.
+pub fn transform_point(linear: [f32; 4], translation: (f32, f32), (x, y): (f32, f32)) -> (f32, f32) {
+    (
+        linear[0] * x + linear[2] * y + translation.0,
+        linear[1] * x + linear[3] * y + translation.1,
+    )
+}
+
 fn ndc_to_pixel_position((x, y): (f32, f32)) -> (f32, f32) {
     (
         x / NDC_VIEW_MAX_X * FB_WIDTH as f32,
@@ -222,6 +242,11 @@ pub struct LiveGlState {
     pub current_state_ptr: u32,
     pub current_material_epoch: u64,
     pub translation: (f32, f32),
+    /// Rotation and scale composed into the 2D draw transform by
+    /// OpenGLES:173/171, column-major `[a, b, c, d]`: a vertex `(x, y)` lands
+    /// at `(a*x + c*y, b*x + d*y) + translation`. Identity for the title
+    /// families that only translate.
+    pub linear: [f32; 4],
     /// The current vertex MVP uploaded through OpenGLES:125. Vortex submits
     /// model-space glyphs for its gameplay objects and Hold'em submits its
     /// animated card scene the same way; most other title families pass
@@ -345,6 +370,7 @@ impl LiveGlState {
             current_state_ptr: 0,
             current_material_epoch: 0,
             translation: (0.0, 0.0),
+            linear: IDENTITY_LINEAR,
             mvp: None,
             frame_base_translation: (0.0, 0.0),
             board_base_translation_valid: false,
@@ -464,6 +490,7 @@ impl LiveGlState {
         self.arrays.clear();
         self.enabled_arrays.clear();
         self.translation = (0.0, 0.0);
+        self.linear = IDENTITY_LINEAR;
         self.frame_material_bound = false;
         // Tetris composes the initial board once, then submits only the
         // changed cell materials on later frames. Keep the learned origin
@@ -2535,6 +2562,19 @@ mod tests {
     }
 
     #[test]
+    fn linear_transform_rotates_about_the_translated_origin() {
+        // translate(10, 20) · rotate(90°) · translate(0, 5), as Zuma composes its frog
+        let rotate = [0.0, 1.0, -1.0, 0.0];
+        let linear = multiply_linear(IDENTITY_LINEAR, rotate);
+        let offset = transform_point(linear, (0.0, 0.0), (0.0, 5.0));
+        let translation = (10.0 + offset.0, 20.0 + offset.1);
+        assert_eq!(translation, (5.0, 20.0));
+        assert_eq!(transform_point(linear, translation, (2.0, 0.0)), (5.0, 22.0));
+        // Without a rotation the transform is the plain sum
+        assert_eq!(transform_point(IDENTITY_LINEAR, (3.0, 4.0), (1.0, 1.0)), (4.0, 5.0));
+    }
+
+    #[test]
     fn reset_for_frame_clears_per_frame_state_but_keeps_uploads() {
         let mut lg = LiveGlState::new(true, false, false, "test".to_string());
         lg.uploads.push(LiveGlState::build_upload(
@@ -2549,11 +2589,13 @@ mod tests {
             None,
         ));
         lg.translation = (10.0, 20.0);
+        lg.linear = [0.0, 1.0, -1.0, 0.0];
         lg.mvp = Some([1.0; 16]);
         lg.draw_count_in_frame = 2;
         lg.framebuffer[0] = Rgba8::rgba(1, 2, 3, 4);
         lg.reset_for_frame();
         assert_eq!(lg.translation, (0.0, 0.0));
+        assert_eq!(lg.linear, IDENTITY_LINEAR);
         assert_eq!(lg.mvp, None);
         assert_eq!(lg.draw_count_in_frame, 0);
         assert_eq!(lg.framebuffer[0], Rgba8::rgba(0, 0, 0, 0));
