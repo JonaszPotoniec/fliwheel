@@ -56,6 +56,12 @@ impl RetailFiles {
         Some(stream)
     }
 
+    /// Drop the cached contents of a file that has been rewritten. Streams
+    /// already open keep what they were reading.
+    pub fn forget(&mut self, path: &Path) {
+        self.cache.remove(path);
+    }
+
     /// Resolve a request to its stream: the file object first, then the
     /// stream id the request carries.
     pub fn stream_for(&self, object: u32, stream: u32) -> Option<u32> {

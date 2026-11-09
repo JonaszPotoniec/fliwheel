@@ -19,6 +19,7 @@ mod gl_trace;
 mod live_gl;
 mod rasterizer;
 mod retail_files;
+mod save_store;
 mod usse;
 pub use gl_decode::{
     bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
@@ -36,6 +37,7 @@ pub use rasterizer::{
     rasterize_triangle, sample_nearest, Rgba8, Texture, TextureFormat,
 };
 use retail_files::RetailFiles;
+use save_store::SaveStore;
 use usse::{UsseProgram, UsseVm};
 
 use crate::devices::generic::Ram;
@@ -819,6 +821,8 @@ pub struct Eapp {
     /// Streams opened through the RetailOS file-service contract (see
     /// `handle_retail_async_file_io`).
     retail_files: RetailFiles,
+    /// The title's writable files, the iPod's `GameData_RW/<GameID>`.
+    save_store: SaveStore,
     /// Requests whose RetailOS operation has finished and whose completion
     /// callback is owed before the next frame.
     retail_completions: Vec<u32>,
@@ -1158,6 +1162,7 @@ impl Eapp {
             || bundle_path_str.contains("55555")
             || bundle_path_str.contains("99999");
         let string_trace_enabled = string_trace_enabled();
+        let save_root = image.metadata.bundle_dir.join(SAVE_DIR);
 
         let mut eapp = Eapp {
             cpu,
@@ -1259,6 +1264,7 @@ impl Eapp {
             async_file_offsets: HashMap::new(),
             next_async_file_handle: 1,
             retail_files: RetailFiles::default(),
+            save_store: SaveStore::new(save_root),
             retail_completions: Vec::new(),
             filesystem_open_files: HashMap::new(),
             next_filesystem_handle: 1,
@@ -1408,6 +1414,31 @@ impl Eapp {
     pub fn wheel_touch_callback(&self) -> Box<dyn FnMut(Option<u8>) + Send> {
         let state = Arc::clone(&self.input_state);
         Box::new(move |angle| state.lock().unwrap().wheel_touch = angle)
+    }
+
+    /// Keep this title's saves under `root` instead of inside its bundle,
+    /// bringing along any saved by earlier builds.
+    pub fn set_save_root(&mut self, root: impl Into<PathBuf>) {
+        if let Err(error) = self.save_store.flush_all() {
+            warn!(target: "EAPP_IMPORT", "saves could not be flushed: {}", error);
+        }
+        self.save_store = SaveStore::new(root.into());
+        for old in [SAVE_DIR, LEGACY_SAVE_DIR] {
+            let old = self.metadata.bundle_dir.join(old);
+            if let Err(error) = self.save_store.migrate_from(&old) {
+                warn!(target: "EAPP_IMPORT", "saves in {} could not be moved: {}", old.display(), error);
+            }
+        }
+    }
+
+    /// Counts save files written to disk. Take this after `set_save_root`.
+    pub fn save_commits(&self) -> Arc<AtomicU64> {
+        self.save_store.commits()
+    }
+
+    /// Put every pending save on disk.
+    pub fn flush_saves(&mut self) -> std::io::Result<()> {
+        self.save_store.flush_all()
     }
 
     pub fn stop_signal(&self) -> Arc<AtomicBool> {
@@ -2601,6 +2632,12 @@ impl Eapp {
                 pc,
                 lr
             );
+        }
+
+        if matches!(import.module.as_str(), "AsyncFileIO" | "Filesytem")
+            && fliwheel_var_os("FILE_TRACE").is_some()
+        {
+            self.trace_file_import(&import.module, import.ordinal, pc, lr, args);
         }
 
         let ret = match import.module.as_str() {
@@ -8444,16 +8481,11 @@ impl Eapp {
         let result = if buf != 0 && len != 0 {
             // An open that carries a buffer is a load, header-sized ones
             // included: Bowling probes each `.wav` with a 44-byte buffer and
-            // its audio loader stalls if that header is not filled. A
-            // write-mode open moves nothing in.
-            let got = if mode & 0xff == 1 {
-                0
-            } else {
-                let bytes = self.retail_files.read(stream, len);
-                self.retail_files.rewind(stream);
-                let _ = self.write_guest_bytes(buf, &bytes);
-                bytes.len() as u32
-            };
+            // its audio loader stalls if that header is not filled.
+            let bytes = self.retail_files.read(stream, len);
+            self.retail_files.rewind(stream);
+            let _ = self.write_guest_bytes(buf, &bytes);
+            let got = bytes.len() as u32;
             self.write_guest_u32(req.wrapping_add(0x24), got);
             got
         } else {
@@ -8584,120 +8616,54 @@ impl Eapp {
             return 0;
         }
 
-        // Direct file-handle read path. Tetris reaches this after a Menu input:
-        // wrapper 0x609c calls AsyncFileIO:14(handle, buffer, len) after
-        // wrapper 0x6068 opened `prefs.sav` with ordinal 12. Earlier emulation
-        // only returned `len`, which meant the guest buffer stayed stale even
-        // though the call looked successful. Copy the tracked host bytes into
-        // the guest buffer and zero-fill short reads so successful reads do not
-        // expose uninitialized guest memory.
-        if ordinal == 14 {
+        // Direct file handles are the save path of every title: one guest
+        // routine opens with #12, writes with #16 and closes with #14, and
+        // none reads through them. The wrappers (Tetris 0x6068, 0x603c,
+        // 0x609c) only call #16 while the open status at `[file+4]` is 0 or 5
+        // and store what it returns there; zero means the save succeeded.
+        // #14 is passed just the handle, so r1 and r2 hold whatever #16 left.
+        if ordinal == 16 {
             let handle = args[0];
             let buffer = args[1];
             let len = args[2] as usize;
-            if self.metadata.title == "12345" {
-                // Vortex uses the same ordinal for its synchronous pause-menu
-                // save writer. PR #3 opens `stats`/`en/stats` with #12,
-                // writes the guest buffer with #14, and expects status zero;
-                // do not send this shape through the read contract above.
-                if handle == u32::MAX || buffer == 0 || len >= 1 << 24 {
-                    warn!(
-                        target: "EAPP_IMPORT",
-                        "AsyncFileIO:14 Vortex write called with invalid args=[{:#010x},{:#010x},{:#010x},{:#010x}]",
-                        args[0],
-                        args[1],
-                        args[2],
-                        args[3]
-                    );
-                    return 1;
-                }
-                let Some(host_path) = self.async_open_files.get(&handle).cloned() else {
-                    warn!(
-                        target: "EAPP_IMPORT",
-                        "AsyncFileIO:14 Vortex unknown write handle={} buffer={:#010x} len={}",
-                        handle,
-                        buffer,
-                        len
-                    );
-                    return 1;
-                };
-                let Some(bytes) = self.read_guest_bytes(buffer, len) else {
-                    warn!(
-                        target: "EAPP_IMPORT",
-                        "AsyncFileIO:14 Vortex could not read guest write buffer={:#010x} len={}",
-                        buffer,
-                        len
-                    );
-                    return 1;
-                };
-                let offset = self.async_file_offsets.get(&handle).copied().unwrap_or(0);
-                let end = offset.saturating_add(bytes.len());
-                let mut file_bytes = fs::read(&host_path).unwrap_or_default();
-                if file_bytes.len() < end {
-                    file_bytes.resize(end, 0);
-                }
-                file_bytes[offset..end].copy_from_slice(&bytes);
-                let ok = fs::write(&host_path, &file_bytes).is_ok();
-                if ok {
-                    self.async_file_offsets.insert(handle, end);
-                }
-                info!(
-                    target: "EAPP_IMPORT",
-                    "AsyncFileIO:14 Vortex write handle={} path={} buffer={:#010x} len={} offset={} result={}",
-                    handle,
-                    host_path.display(),
-                    buffer,
-                    len,
-                    offset,
-                    if ok { "ok" } else { "FAILED" }
-                );
-                return if ok { 0 } else { 1 };
-            }
-            if handle == u32::MAX || buffer == 0 {
-                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 called with invalid args=[{:#010x},{:#010x},{:#010x},{:#010x}]", args[0], args[1], args[2], args[3]);
-                return 0;
-            }
             let Some(host_path) = self.async_open_files.get(&handle).cloned() else {
-                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 unknown handle={} buffer={:#010x} len={}", handle, buffer, len);
-                return 0;
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:16 unknown handle={} buffer={:#010x} len={}", handle, buffer, len);
+                return 1;
             };
-            let bytes = fs::read(&host_path).unwrap_or_else(|e| {
-                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 read error for {}: {}", host_path.display(), e);
-                Vec::new()
-            });
-            let n = bytes.len().min(len);
-            let mut out = vec![0u8; len];
-            out[..n].copy_from_slice(&bytes[..n]);
-            let delivered = self.write_guest_bytes(buffer, &out);
-            info!(
-                target: "EAPP_IMPORT",
-                "AsyncFileIO:14 handle={} path={} buffer={:#010x} len={} file_bytes={} delivered={}",
-                handle,
-                host_path.display(),
-                buffer,
-                len,
-                bytes.len(),
-                delivered
-            );
-            return if delivered { n as u32 } else { 0 };
+            if buffer == 0 || len >= 1 << 24 {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:16 invalid write buffer={:#010x} len={}", buffer, len);
+                return 1;
+            }
+            let Some(bytes) = self.read_guest_bytes(buffer, len) else {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:16 could not read guest buffer={:#010x} len={}", buffer, len);
+                return 1;
+            };
+            let offset = self.async_file_offsets.get(&handle).copied().unwrap_or(0);
+            // A save is written whole, so the first write replaces the file.
+            // Doing that here rather than at open keeps the old save when
+            // the game opens the file and writes nothing.
+            if offset == 0 {
+                self.save_store.begin_write(&host_path, true);
+            }
+            self.save_store.write_at(&host_path, offset, &bytes);
+            self.async_file_offsets.insert(handle, offset + len);
+            info!(target: "EAPP_IMPORT", "AsyncFileIO:16 write path={} offset={} len={}", host_path.display(), offset, len);
+            return 0;
         }
 
-        // Direct file-handle status poll. Wrapper 0x603c calls this when the
-        // open status in `[file+4]` is 0 or 5. Returning 1 keeps the guest's
-        // status compatible with the earlier accidental behavior (open return
-        // value was handle 1) while still separating status from `[file+0]`.
-        if ordinal == 16 {
+        if ordinal == 14 {
             let handle = args[0];
-            let known = self.async_open_files.contains_key(&handle);
-            info!(target: "EAPP_IMPORT", "AsyncFileIO:16 handle={} known={}", handle, known);
-            if self.metadata.title == "12345" {
-                // Vortex's #16 is the synchronous close paired with its
-                // pause-menu #12/#14 write sequence. The PR #3 contract uses
-                // zero for a successful close; the read/status convention
-                // below remains for the older direct-handle callers.
+            self.async_file_offsets.remove(&handle);
+            let Some(host_path) = self.async_open_files.remove(&handle) else {
+                warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 unknown handle={}", handle);
                 return 0;
+            };
+            match self.save_store.commit(&host_path) {
+                Ok(()) => info!(target: "EAPP_IMPORT", "AsyncFileIO:14 closed {}", host_path.display()),
+                Err(error) => warn!(target: "EAPP_IMPORT", "AsyncFileIO:14 could not save {}: {}", host_path.display(), error),
             }
-            return if known { 1 } else { 0 };
+            self.retail_files.forget(&host_path);
+            return 0;
         }
 
         if ordinal == 1 {
@@ -9588,12 +9554,12 @@ impl Eapp {
             info!(target: "EAPP_IMPORT", "AsyncFileIO:{} path={}", ordinal, path);
 
             if ordinal == 12 {
-                // Direct open-like call used by wrapper 0x6068:
-                //   r0 = mode/flags, r1 = path, r2 = file object / out-handle.
+                // Open for saving, from wrapper 0x6068:
+                //   r0 = mode, r1 = path, r2 = file object / out-handle.
                 // The wrapper stores the import return in `[file+4]` (status)
-                // and passes `[file+0]` to ordinal 14. Therefore the handle
+                // and passes `[file+0]` to #16 and #14. Therefore the handle
                 // belongs in `*r2`, while the return value is a status code.
-                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                if let Some(host_path) = self.save_store.host_path(&path) {
                     let handle = self.next_async_file_handle;
                     self.next_async_file_handle =
                         self.next_async_file_handle.wrapping_add(1).max(1);
@@ -9686,7 +9652,7 @@ impl Eapp {
                     || mspacman_complete
                     || mahjong_complete;
                 let callback_pc = self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0);
-                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                if let Some(host_path) = self.resolve_open_path(&path) {
                     self.note_audio_asset_path(&host_path);
                     let lost_handle = if is_lost {
                         let handle = self.next_async_file_handle;
@@ -9720,7 +9686,7 @@ impl Eapp {
                     } else {
                         None
                     };
-                    let bytes = fs::read(&host_path).unwrap_or_else(|e| {
+                    let bytes = self.read_open_file(&host_path).unwrap_or_else(|e| {
                         warn!(
                             target: "EAPP_IMPORT",
                             "AsyncFileIO:0 read error for {}: {}",
@@ -9954,9 +9920,8 @@ impl Eapp {
                         // while a resource such as constant.blob must still report success;
                         // applying one status to every ordinal-0 request makes the latter
                         // look missing and leaves its object tables uninitialized.
-                        let texas_missing_save = host_path.to_str().map_or(false, |p| {
-                            p.contains(SAVE_DIR) || p.contains(LEGACY_SAVE_DIR)
-                        });
+                        let texas_missing_save = self.save_store.owns(&host_path)
+                            && self.save_store.read(&host_path).map_or(true, |d| d.is_empty());
                         let status = if texas_complete && texas_missing_save {
                             std::env::var("EAPP_TEXAS_ASYNC0_STATUS")
                                 .ok()
@@ -10020,14 +9985,14 @@ impl Eapp {
                     let want = self.read_guest_u32(req.wrapping_add(0x18)).unwrap_or(0);
                     let callback_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
                     let callback_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
-                    if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    if let Some(host_path) = self.resolve_open_path(&path) {
                         self.note_audio_asset_path(&host_path);
                         let handle = self.next_async_file_handle;
                         self.next_async_file_handle =
                             self.next_async_file_handle.wrapping_add(1).max(1);
                         self.async_open_files.insert(handle, host_path.clone());
                         self.write_guest_u32(req.wrapping_add(0x2c), handle);
-                        match fs::read(&host_path) {
+                        match self.read_open_file(&host_path) {
                             Ok(bytes) => {
                                 let requested_len = if want != 0 {
                                     want as usize
@@ -10109,7 +10074,7 @@ impl Eapp {
                     warn!(target: "EAPP_IMPORT", "AsyncFileIO:3 Vortex missing host path {}", path);
                     return 0;
                 }
-                if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                if let Some(host_path) = self.resolve_open_path(&path) {
                     self.note_audio_asset_path(&host_path);
                     // Request-object protocol (observed):
                     //   [req+0x14] = guest-provided destination buffer
@@ -10135,7 +10100,7 @@ impl Eapp {
                             path
                         );
                     }
-                    match fs::read(&host_path) {
+                    match self.read_open_file(&host_path) {
                         Ok(bytes) => {
                             let requested_len = if want != 0 {
                                 want as usize
@@ -10415,7 +10380,7 @@ impl Eapp {
                                 }
                             }
                         }
-                    } else if let Some(host_path) = self.resolve_or_create_host_path(&path) {
+                    } else if let Some(host_path) = self.resolve_open_path(&path) {
                         if let Ok(read_dir) = fs::read_dir(&host_path) {
                             for entry in read_dir.flatten() {
                                 let full = host_path.join(entry.file_name());
@@ -10500,11 +10465,11 @@ impl Eapp {
                     warn!(target: "EAPP_IMPORT", "Filesytem:0 called without a path");
                     return 1;
                 };
-                let Some(host_path) = self.resolve_or_create_host_path(path) else {
+                let Some(host_path) = self.resolve_open_path(path) else {
                     warn!(target: "EAPP_IMPORT", "Filesytem:0 could not resolve path {:?}", path);
                     return 1;
                 };
-                if !host_path.is_file() {
+                if !host_path.is_file() && (host_path.is_dir() || !self.save_store.owns(&host_path)) {
                     warn!(target: "EAPP_IMPORT", "Filesytem:0 path is not a file: {}", host_path.display());
                     return 1;
                 }
@@ -10547,7 +10512,7 @@ impl Eapp {
                     warn!(target: "EAPP_IMPORT", "Filesytem:2 unknown handle={} buffer={:#010x} len={}", handle, buffer, length);
                     return 0;
                 };
-                let bytes = fs::read(&file.host_path).unwrap_or_else(|error| {
+                let bytes = self.read_open_file(&file.host_path).unwrap_or_else(|error| {
                     warn!(target: "EAPP_IMPORT", "Filesytem:2 read error for {}: {}", file.host_path.display(), error);
                     Vec::new()
                 });
@@ -12766,6 +12731,29 @@ impl Eapp {
     /// Best-effort diagnostic dump of the AsyncFileIO request-object layout.
     /// Used to reverse-engineer where the guest expects file payload/length to
     /// be written. Logged once per request object address.
+    /// `FLIWHEEL_FILE_TRACE`: one line per file import with everything its
+    /// arguments reach, to tell reads from writes across the engines.
+    fn trace_file_import(&mut self, module: &str, ordinal: u32, pc: u32, lr: u32, args: [u32; 4]) {
+        let mut line = format!(
+            "frame={} {}:{} pc={:#010x} lr={:#010x} args=[{:#x},{:#x},{:#x},{:#x}]",
+            self.frame_counter, module, ordinal, pc, lr, args[0], args[1], args[2], args[3]
+        );
+        for (index, arg) in args.iter().copied().enumerate() {
+            if let Some(text) = self.try_read_c_string(arg, 128) {
+                line.push_str(&format!(" r{index}={text:?}"));
+            } else if arg >= 0x1000 {
+                if let Some(bytes) = self.read_guest_bytes(arg, 0x40) {
+                    line.push_str(&format!(" r{index}@"));
+                    for word in bytes.chunks_exact(4) {
+                        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                        line.push_str(&format!("{word:x},"));
+                    }
+                }
+            }
+        }
+        info!(target: "FILE_TRACE", "{}", line);
+    }
+
     fn dump_request_object(&mut self, req: u32) {
         if req == 0 || !self.dumped_requests.insert(req) {
             return;
@@ -12871,6 +12859,9 @@ impl Eapp {
 
     fn resolve_bundle_path(&self, path: &str) -> Option<PathBuf> {
         let normalized = path.trim_start_matches('/').trim_start_matches('\\');
+        if let Some(saved) = self.save_store.existing(normalized) {
+            return Some(saved);
+        }
         for candidate in [path, normalized] {
             if candidate.is_empty() {
                 continue;
@@ -12897,7 +12888,7 @@ impl Eapp {
         }
         for save_dir in [SAVE_DIR, LEGACY_SAVE_DIR] {
             let saved = self.metadata.bundle_dir.join(save_dir).join(normalized);
-            if saved.exists() {
+            if fs::metadata(&saved).map_or(false, |meta| meta.len() > 0) {
                 return Some(saved);
             }
         }
@@ -12931,24 +12922,20 @@ impl Eapp {
         None
     }
 
-    fn resolve_or_create_host_path(&self, path: &str) -> Option<PathBuf> {
-        if let Some(found) = self.resolve_bundle_path(path) {
-            return Some(found);
-        }
+    /// The host file a guest open refers to. A path found nowhere is where
+    /// the file would be saved; nothing is created until the guest writes it,
+    /// and until then it reads as empty through `read_open_file`.
+    fn resolve_open_path(&self, path: &str) -> Option<PathBuf> {
+        self.resolve_bundle_path(path)
+            .or_else(|| self.save_store.host_path(path))
+    }
 
-        let normalized = path.trim_start_matches('/').trim_start_matches('\\');
-        if normalized.is_empty() {
-            return None;
+    /// Contents of a file from `resolve_open_path`.
+    fn read_open_file(&self, host_path: &Path) -> std::io::Result<Vec<u8>> {
+        if self.save_store.owns(host_path) {
+            return Ok(self.save_store.read(host_path).unwrap_or_default());
         }
-
-        let writable = self.metadata.bundle_dir.join(SAVE_DIR).join(normalized);
-        if let Some(parent) = writable.parent() {
-            fs::create_dir_all(parent).ok()?;
-        }
-        if !writable.exists() {
-            fs::write(&writable, []).ok()?;
-        }
-        Some(writable)
+        fs::read(host_path)
     }
 
     fn try_read_c_string(&mut self, addr: u32, max_len: usize) -> Option<String> {

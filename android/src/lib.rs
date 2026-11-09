@@ -6,12 +6,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use fliwheel_core::gui::{ButtonCallback, RenderCallback, ScrollCallback, TakeControls};
 use fliwheel_core::sys::eapp::{Eapp, EappAudioEventQueue, EappKey};
 use jni::objects::{JClass, JIntArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+const QUIT_MENU_PRESS: Duration = Duration::from_millis(120);
+const QUIT_SAVE_TIMEOUT: Duration = Duration::from_millis(2000);
+const QUIT_SAVE_SETTLE: Duration = Duration::from_millis(300);
 
 struct EmulatorSession {
     render_cb: RenderCallback,
@@ -21,6 +27,8 @@ struct EmulatorSession {
     audio_queue: EappAudioEventQueue,
     stop_signal: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    flush_saves: Arc<AtomicBool>,
+    save_commits: Arc<AtomicU64>,
     frame_seq: Arc<AtomicU64>,
     last_rendered_seq: u64,
     emu_thread: Option<thread::JoinHandle<()>>,
@@ -62,6 +70,28 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
     _class: JClass,
     bundle_path: JString,
 ) -> jlong {
+    init_session(&mut env, bundle_path, None)
+}
+
+/// `nativeInit` with the title's saves kept in `save_root`.
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInitWithSaves(
+    mut env: JNIEnv,
+    _class: JClass,
+    bundle_path: JString,
+    save_root: JString,
+) -> jlong {
+    let save_root = match env.get_string(&save_root) {
+        Ok(path) => Some(String::from(path)),
+        Err(e) => {
+            append_game_log(&format!("nativeInitWithSaves: bad save_root: {:?}", e));
+            None
+        }
+    };
+    init_session(&mut env, bundle_path, save_root)
+}
+
+fn init_session(env: &mut JNIEnv, bundle_path: JString, save_root: Option<String>) -> jlong {
     #[cfg(target_os = "android")]
     {
         let _ = android_logger::init_once(
@@ -101,6 +131,11 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
         }
     };
 
+    if let Some(save_root) = save_root {
+        system.set_save_root(save_root);
+    }
+    let save_commits = system.save_commits();
+
     let update_fb = system.render_callback();
     let touch_cb = system.wheel_touch_callback();
     let audio_events = system.audio_event_queue();
@@ -120,6 +155,8 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
     let stop_signal_clone = Arc::clone(&stop_signal);
     let paused = Arc::new(AtomicBool::new(false));
     let paused_clone = Arc::clone(&paused);
+    let flush_saves = Arc::new(AtomicBool::new(false));
+    let flush_saves_clone = Arc::clone(&flush_saves);
     let emu_thread = thread::Builder::new()
         .name("FliwheelEmu".to_string())
         .spawn(move || {
@@ -129,6 +166,12 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
             let mut last_seq = 0u64;
 
             while !stop_signal_clone.load(Ordering::Relaxed) {
+                if flush_saves_clone.load(Ordering::Relaxed) {
+                    if let Err(err) = system.flush_saves() {
+                        append_game_log(&format!("Saves could not be written: {}", err));
+                    }
+                    flush_saves_clone.store(false, Ordering::Relaxed);
+                }
                 if paused_clone.load(Ordering::Relaxed) {
                     thread::sleep(std::time::Duration::from_millis(10));
                     continue;
@@ -166,6 +209,8 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
         audio_queue: audio_events,
         stop_signal,
         paused,
+        flush_saves,
+        save_commits,
         frame_seq,
         last_rendered_seq: 0,
         emu_thread,
@@ -305,6 +350,61 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeSetPaused(
     }
     let session = unsafe { &*(handle as *const EmulatorSession) };
     session.paused.store(paused == JNI_TRUE, Ordering::Relaxed);
+}
+
+/// Writes pending saves and waits briefly for the emulator thread to do it.
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeFlushSaves(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let session = unsafe { &*(handle as *const EmulatorSession) };
+    session.flush_saves.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+    while session.flush_saves.load(Ordering::Relaxed) && started.elapsed() < FLUSH_TIMEOUT {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Gives the game the chance to save before it is stopped, as leaving a game
+/// does on an iPod: runs it again, presses Menu, and returns once its save
+/// files have stopped changing. A game with nothing to save takes the whole
+/// timeout; whatever it does after Menu no longer matters, since the session
+/// ends next.
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeRequestQuit(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let session = unsafe { &mut *(handle as *mut EmulatorSession) };
+    session.paused.store(false, Ordering::Relaxed);
+    let mut seen = session.save_commits.load(Ordering::Relaxed);
+    if let Some(press) = session.key_callbacks.get_mut(&EappKey::Menu) {
+        press(true);
+        thread::sleep(QUIT_MENU_PRESS);
+        press(false);
+    }
+    let started = Instant::now();
+    let mut last_save = None;
+    while started.elapsed() < QUIT_SAVE_TIMEOUT {
+        thread::sleep(Duration::from_millis(20));
+        let commits = session.save_commits.load(Ordering::Relaxed);
+        if commits != seen {
+            seen = commits;
+            last_save = Some(Instant::now());
+        }
+        if last_save.map_or(false, |at: Instant| at.elapsed() >= QUIT_SAVE_SETTLE) {
+            break;
+        }
+    }
 }
 
 /// Frees the session. The caller must make sure no other native call on this handle

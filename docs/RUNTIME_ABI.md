@@ -248,7 +248,7 @@ aux(app_obj)       → recurring callback (frame-like in Tetris; not universally
 - `GL:137` + `GL:40` — vertex array setup
 - `Ordinal165State` — per-frame setup
 - Input event contract
-- Save file semantics
+- Save file semantics (see Saves)
 
 ### Tier 3: Compatibility
 - Alternative .eapp versions
@@ -257,6 +257,28 @@ aux(app_obj)       → recurring callback (frame-like in Tetris; not universally
 - Music library APIs
 
 ---
+
+## Saves
+
+Every local title (15 executables, checked statically) saves through one routine that calls the three direct-handle `AsyncFileIO` ordinals in this order. No title references another write ordinal, and `Filesytem` (open, close and read only) is read-only.
+
+| Ordinal | Call | Result |
+|---|---|---|
+| 12 | `open(mode, path, file_object)`: handle goes in `file_object[0]` | status, stored at `[file_object+4]` |
+| 16 | `write(handle, buffer, len)`: only called while that status is 0 or 5 | status, 0 means saved |
+| 14 | `close(handle)` | ignored |
+
+`#14` receives only the handle. Its r1 and r2 are whatever `#16` left there, which earlier notes misread as `#14(handle, buffer, len)`.
+
+Saves are read back through the normal async opens (`AsyncFileIO:0/3`), which take the same mode as their first argument. Observed modes: 0 for bundle files, 1 for saves, 2 for `en/stats`. That fits the firmware's `games_RO`, `gamedata_RW` and `gamestats_WO`, but it is inferred, not proven. Fliwheel keeps all of a title's saves in one folder.
+
+`SaveStore` (`core/src/sys/eapp/save_store.rs`) holds them. A file is written whole on `#14`, through a temp file and a rename. A file that was never saved reads as empty, and nothing is created for it.
+
+Verified end to end on Vortex only: the Menu route writes `options`, `quicka`, `stats` and `en/stats` with the reference sizes, and a relaunch loads `options`. RetailOS's real commit behaviour is unknown.
+
+Tetris's saver (`0x154c0`) only reaches `#12` when the fields at `+0x118` and `+0x11c` of its save object are set, and no scripted route has reached it yet.
+
+The frame vector's context byte is a lifecycle state: 0 init, 1 frame, 5 suspend or quit, 6 ending (Tetris: Menu sets a quit flag at `0x5034`, then 5, then 6). Fliwheel does not drive 5 from the host. Quitting presses Menu and waits for the save files to settle.
 
 ## 10. HLE Implementation Guide
 
