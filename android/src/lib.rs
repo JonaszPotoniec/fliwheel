@@ -19,6 +19,7 @@ struct EmulatorSession {
     scroll_cb: Option<ScrollCallback>,
     audio_queue: EappAudioEventQueue,
     stop_signal: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     frame_seq: Arc<AtomicU64>,
     last_rendered_seq: u64,
     emu_thread: Option<thread::JoinHandle<()>>,
@@ -115,6 +116,8 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
     let log_path = bundle_path_str.clone();
     let frame_seq_clone = Arc::clone(&frame_seq);
     let stop_signal_clone = Arc::clone(&stop_signal);
+    let paused = Arc::new(AtomicBool::new(false));
+    let paused_clone = Arc::clone(&paused);
     let emu_thread = thread::Builder::new()
         .name("FliwheelEmu".to_string())
         .spawn(move || {
@@ -124,6 +127,10 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
             let mut last_seq = 0u64;
 
             while !stop_signal_clone.load(Ordering::Relaxed) {
+                if paused_clone.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
                 match system.run_cycles(1_000_000) {
                     Ok(()) => {}
                     Err(err) => {
@@ -155,6 +162,7 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
         scroll_cb: controls.wheel,
         audio_queue: audio_events,
         stop_signal,
+        paused,
         frame_seq,
         last_rendered_seq: 0,
         emu_thread,
@@ -266,6 +274,22 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativePollAudio(
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeSetPaused(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    paused: jboolean,
+) {
+    if handle == 0 {
+        return;
+    }
+    let session = unsafe { &*(handle as *const EmulatorSession) };
+    session.paused.store(paused == JNI_TRUE, Ordering::Relaxed);
+}
+
+/// Frees the session. The caller must make sure no other native call on this handle
+/// (render, key, wheel, audio poll) is running or can start once this is called.
 #[no_mangle]
 pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeDestroy(
     _env: JNIEnv,
