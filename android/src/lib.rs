@@ -17,6 +17,7 @@ struct EmulatorSession {
     render_cb: RenderCallback,
     key_callbacks: HashMap<EappKey, ButtonCallback>,
     scroll_cb: Option<ScrollCallback>,
+    touch_cb: Box<dyn FnMut(Option<u8>) + Send>,
     audio_queue: EappAudioEventQueue,
     stop_signal: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -101,6 +102,7 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
     };
 
     let update_fb = system.render_callback();
+    let touch_cb = system.wheel_touch_callback();
     let audio_events = system.audio_event_queue();
     let controls = match system.take_controls() {
         Some(c) => c,
@@ -160,6 +162,7 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeInit(
         render_cb: update_fb,
         key_callbacks: controls.keys,
         scroll_cb: controls.wheel,
+        touch_cb,
         audio_queue: audio_events,
         stop_signal,
         paused,
@@ -245,6 +248,22 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeSendWheel(
     if let Some(cb) = session.scroll_cb.as_mut() {
         cb((0.0, delta));
     }
+}
+
+/// Where the finger rests on a position-sensing wheel: `angle` in the guest's
+/// counter-clockwise byte ring (Right = 0, Top = 64), or negative when it lifts.
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeSendWheelTouch(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    angle: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    let session = unsafe { &mut *(handle as *mut EmulatorSession) };
+    (session.touch_cb)(if angle < 0 { None } else { Some((angle & 0xff) as u8) });
 }
 
 #[no_mangle]

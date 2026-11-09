@@ -525,6 +525,11 @@ pub struct EappInputState {
     pub action: bool,
     pub menu: bool,
     pub wheel_delta: f32,
+    /// Where a finger rests on the wheel, in the guest's counter-clockwise
+    /// byte ring (Right = 0, Top = 64), or `None` with no finger. Only hosts
+    /// whose wheel senses position report it (the Y2's touch-pad mask); while
+    /// it is set, every title gets this angle instead of `wheel_delta`.
+    pub wheel_touch: Option<u8>,
 }
 
 /// A guest-side sound trigger resolved to the resource index used by the
@@ -1373,6 +1378,13 @@ impl Eapp {
             buf.splice(.., frame.iter().copied());
             (SCREEN_WIDTH, SCREEN_HEIGHT)
         })
+    }
+
+    /// Host callback for a position-sensing wheel: the touch angle in the
+    /// guest's counter-clockwise byte ring, or `None` when the finger lifts.
+    pub fn wheel_touch_callback(&self) -> Box<dyn FnMut(Option<u8>) + Send> {
+        let state = Arc::clone(&self.input_state);
+        Box::new(move |angle| state.lock().unwrap().wheel_touch = angle)
     }
 
     pub fn stop_signal(&self) -> Arc<AtomicBool> {
@@ -7234,6 +7246,14 @@ impl Eapp {
                     } else {
                         self.lost_wheel_poll_bits(state.wheel_delta)
                     }
+                } else if let Some(angle) = state.wheel_touch {
+                    if self.bejeweled_tap_bits(&state) != 0 {
+                        // A side button's tap (Bejeweled) goes in its own
+                        // packet: the two angles cannot share one.
+                        0
+                    } else {
+                        self.touch_wheel_bits(angle)
+                    }
                 } else if matches!(self.metadata.title.as_str(), "12345" | "11002" | "11050" | "11051" | "11052") {
                     self.lost_wheel_poll_bits(state.wheel_delta)
                 } else if holdem_direct {
@@ -7472,6 +7492,33 @@ impl Eapp {
         Self::wheel_frame_bits(&mut self.wheel_position, delta)
     }
 
+    /// Inverse of [`Self::normalized_wheel_position`]: the detent nearest to
+    /// a guest ring angle.
+    fn wheel_position_for_angle(angle: u8) -> u8 {
+        ((angle as u32 * Self::CLICKWHEEL_DETENTS + Self::EAPP_WHEEL_UNITS / 2) / Self::EAPP_WHEEL_UNITS
+            % Self::CLICKWHEEL_DETENTS) as u8
+    }
+
+    /// A finger on a position-sensing wheel. The iPod wheel reports where the
+    /// finger rests on every poll while it touches, and each title reads that
+    /// its own way (Zuma aims the frog at it, menus follow the motion). The
+    /// relative encoders below go on from that position once it lifts.
+    fn touch_wheel_bits(&mut self, angle: u8) -> u32 {
+        self.sync_wheel_rings(angle);
+        (1 << 30) | angle as u32
+    }
+
+    fn sync_wheel_rings(&mut self, angle: u8) {
+        self.wheel_position = Self::wheel_position_for_angle(angle);
+        self.lost_wheel_raw = Self::lost_raw_for_angle(angle);
+        self.lost_wheel_pending.clear();
+        self.lost_wheel_remainder = 0.0;
+        // Hold'em's raw ring uses the same transform as LOST's
+        self.holdem_wheel_raw = Self::lost_raw_for_angle(angle);
+        self.holdem_wheel_pending.clear();
+        self.holdem_wheel_remainder = 0.0;
+    }
+
     /// LOST and Vortex's InputEvents consumers use the RetailOS encoder
     /// recovered in the PR #3 direct runner. It exposes a 120-step raw ring
     /// through an inverted 8-bit transform rather than the normalized
@@ -7486,12 +7533,20 @@ impl Eapp {
         (1 << 30) | Self::lost_wheel_byte(raw) as u32
     }
 
+    /// Inverse of [`Self::lost_wheel_byte`] over the 96 raw steps that span
+    /// one turn of the byte ring.
+    fn lost_raw_for_angle(angle: u8) -> u8 {
+        (0x77 - (angle as i32 * 3 + 4) / 8) as u8
+    }
+
     /// In LOST (1B200), character movement (walking Jack) is controlled by
     /// resting a finger on the clickwheel at one of the cardinal angles:
     /// Right = 0, Top = 64, Left = 128, Bottom = 192 (counter-clockwise byte ring).
     /// Holding a side reports this fixed touch angle every frame with bit 30 set,
     /// which allows gameplay and the tutorial ("TOUCH THE LOWER SIDE OF THE WHEEL")
     /// to progress when pressing physical or virtual directional controls.
+    /// A host whose wheel senses position reports the finger's own angle the
+    /// same way, as the iPod wheel does.
     fn lost_touch_bits(&mut self, state: &EappInputState) -> Option<u32> {
         let angle = match (state.up, state.down, state.left, state.right) {
             (true, false, false, false) => Some(64u8),   // Top (Up)
@@ -7504,6 +7559,13 @@ impl Eapp {
             (false, true, false, true) => Some(224u8),   // Bottom-Right
             _ => None,
         };
+        let angle = angle.or_else(|| {
+            let touch = state.wheel_touch?;
+            // Relative motion after the finger lifts, and the wheel sample
+            // queued with button events, continue from where it rested.
+            self.sync_wheel_rings(touch);
+            Some(touch)
+        });
         if angle.is_some() {
             self.lost_wheel_pending.clear();
         }
@@ -14132,6 +14194,30 @@ mod tests {
         assert_eq!(Eapp::lost_wheel_packet(8), 0x4000_0028);
         assert_eq!(Eapp::lost_wheel_packet(16), 0x4000_0012);
         assert_eq!(Eapp::lost_wheel_packet(119), 0x4000_0000);
+    }
+
+    #[test]
+    fn wheel_position_for_angle_round_trips_through_the_ring() {
+        for angle in 0..=255u8 {
+            let position = Eapp::wheel_position_for_angle(angle);
+            assert!((position as u32) < Eapp::CLICKWHEEL_DETENTS);
+            let error = Eapp::normalized_wheel_position(position).wrapping_sub(angle) as i8;
+            assert!(error.abs() <= 2, "angle {}: position {}, error {}", angle, position, error);
+        }
+        assert_eq!(Eapp::wheel_position_for_angle(64), 24);
+        assert_eq!(Eapp::wheel_position_for_angle(255), 0);
+    }
+
+    #[test]
+    fn lost_raw_for_angle_round_trips_through_the_encoder() {
+        for angle in 0..=255u8 {
+            let raw = Eapp::lost_raw_for_angle(angle);
+            assert!(raw < Eapp::LOST_WHEEL_DETENTS as u8);
+            let error = Eapp::lost_wheel_byte(raw).wrapping_sub(angle) as i8;
+            assert!(error.abs() <= 2, "angle {}: raw {}, error {}", angle, raw, error);
+        }
+        assert_eq!(Eapp::lost_raw_for_angle(0), 0x77);
+        assert_eq!(Eapp::lost_raw_for_angle(64), 0x77 - 24);
     }
 
     #[test]
