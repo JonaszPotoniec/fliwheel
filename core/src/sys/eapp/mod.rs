@@ -18,6 +18,7 @@ mod gl_decode;
 mod gl_trace;
 mod live_gl;
 mod rasterizer;
+mod retail_files;
 mod usse;
 pub use gl_decode::{
     bytes_from_snapshot, decode_fixed_16_16, first_frame, fixed_words_from_snapshot,
@@ -34,6 +35,7 @@ pub use rasterizer::{
     blend_src_over, decode_texture_pixels, framebuffer_hash, framebuffer_to_ppm, rasterize_quad,
     rasterize_triangle, sample_nearest, Rgba8, Texture, TextureFormat,
 };
+use retail_files::RetailFiles;
 use usse::{UsseProgram, UsseVm};
 
 use crate::devices::generic::Ram;
@@ -814,6 +816,12 @@ pub struct Eapp {
     /// direct reads, so keep write position separate from the read path.
     async_file_offsets: HashMap<u32, usize>,
     next_async_file_handle: u32,
+    /// Streams opened through the RetailOS file-service contract (see
+    /// `handle_retail_async_file_io`).
+    retail_files: RetailFiles,
+    /// Requests whose RetailOS operation has finished and whose completion
+    /// callback is owed before the next frame.
+    retail_completions: Vec<u32>,
     /// Synthetic handles returned by the legacy `Filesytem:0` open call.
     /// These are kept separate from direct AsyncFileIO handles because the
     /// two modules use different object layouts and read contracts.
@@ -1250,6 +1258,8 @@ impl Eapp {
             async_open_files: HashMap::new(),
             async_file_offsets: HashMap::new(),
             next_async_file_handle: 1,
+            retail_files: RetailFiles::default(),
+            retail_completions: Vec::new(),
             filesystem_open_files: HashMap::new(),
             next_filesystem_handle: 1,
             audio_handles: HashMap::new(),
@@ -1341,6 +1351,19 @@ impl Eapp {
             let _ = eapp.write_guest_bytes(eapp.app_object, &[5]);
             eapp.cpu.reg_set(eapp.cpu.mode(), 0, eapp.app_object);
             eapp.cpu.reg_set(eapp.cpu.mode(), 1, eapp.frame_context);
+        }
+        if eapp.is_sims_engine() {
+            // RetailOS hands every vector the eApp manager object and a
+            // pointer 0x100 into it, with reason 5 seeded for the entry call.
+            // The Sims frame vector answers its init handshake through that
+            // second pointer, so the two must be one object.
+            eapp.app_object = eapp.alloc_zeroed(0x400);
+            eapp.frame_context = eapp.app_object.wrapping_add(0x100);
+            let _ = eapp.write_guest_bytes(eapp.app_object, &[5]);
+            eapp.cpu.reg_set(eapp.cpu.mode(), 0, eapp.app_object);
+            eapp.cpu.reg_set(eapp.cpu.mode(), 1, eapp.frame_context);
+            eapp.cpu.reg_set(eapp.cpu.mode(), 2, 0);
+            eapp.cpu.reg_set(eapp.cpu.mode(), 3, 0);
         }
         if eapp.metadata.title == "1B200"
             && fliwheel_var_os("EAPP_LOST_PATCH_RENDER_CALL").is_some()
@@ -7281,6 +7304,14 @@ impl Eapp {
                         // contributes only the wheel sample here.
                         0
                     }
+                    "1500C" | "1500E" => {
+                        // The Sims read only the wheel from this poll (low
+                        // byte = position, bit 30 = touch) and take buttons
+                        // from the event list. A held Center's bit in the
+                        // position byte reads as the finger moving, which
+                        // cancels "Hold Center to validate".
+                        0
+                    }
                     _ => Self::input_state_bits(&state),
                 };
                 let wheel_bits = if self.metadata.title == "1B200" {
@@ -7297,7 +7328,10 @@ impl Eapp {
                     } else {
                         self.touch_wheel_bits(angle)
                     }
-                } else if matches!(self.metadata.title.as_str(), "12345" | "11002" | "11050" | "11051" | "11052") {
+                } else if matches!(
+                    self.metadata.title.as_str(),
+                    "12345" | "11002" | "11050" | "11051" | "11052" | "1500C" | "1500E"
+                ) {
                     self.lost_wheel_poll_bits(state.wheel_delta)
                 } else if holdem_direct {
                     self.holdem_wheel_poll_bits(state.wheel_delta)
@@ -7414,8 +7448,12 @@ impl Eapp {
                 };
                 let input_ctx = if input_obj == r4 { r5 } else { r4 };
                 let reversed_owner = !r4_is_work_ram && r5_is_work_ram;
-                if matches!(self.metadata.title.as_str(), "1B200" | "11002" | "11050" | "11051" | "11052") && self.app_object != 0 {
-                    // LOST, iQuiz, and SAT Prep frame managers keep the event-list head directly in
+                if matches!(
+                    self.metadata.title.as_str(),
+                    "1B200" | "11002" | "11050" | "11051" | "11052" | "1500C" | "1500E"
+                ) && self.app_object != 0
+                {
+                    // LOST, iQuiz, SAT Prep, and the Sims frame managers keep the event-list head directly in
                     // the game-heap app_object. It does not pass that context in a
                     // work-RAM owner register, so the generic owner inference
                     // above otherwise leaves the freshly built list unreachable.
@@ -8348,7 +8386,171 @@ impl Eapp {
         ))
     }
 
+    /// The Sims engine (Bowling `1500C`, Pool `1500E`) runs against
+    /// RetailOS's own lifecycle and file service rather than the per-title
+    /// shortcuts the other bundles use.
+    fn is_sims_engine(&self) -> bool {
+        matches!(self.metadata.title.as_str(), "1500C" | "1500E")
+    }
+
+    /// RetailOS's asynchronous file service for `AsyncFileIO` #0..#4, with
+    /// the request layout measured by the PR #3 direct runner:
+    ///
+    /// ```text
+    /// +0x04 op (3 write, 4 read, 5 seek)   +0x08 file object
+    /// +0x0c seek offset   +0x10 whence     +0x14 buffer   +0x18 length
+    /// +0x20 status (0 ok) +0x24 byte count +0x28 position after the op
+    /// +0x2c stream id     +0x34 completion callback       +0x38 its context
+    /// ```
+    ///
+    /// `[object+8]` carries each operation's result back to the game. Every
+    /// operation, including a failed open, completes through the request's
+    /// callback before the next frame. Returns `None` for ordinals this
+    /// service does not own.
+    fn handle_retail_async_file_io(&mut self, ordinal: u32, args: [u32; 4]) -> Option<u32> {
+        let result = match ordinal {
+            0 => self.retail_open(args[0], args[1], args[3]),
+            3 => self.retail_open(args[0], args[1], args[2]),
+            2 => self.retail_transfer(args[0]),
+            1 | 4 => {
+                let req = if ordinal == 1 { args[0] } else { args[2] };
+                self.write_guest_u32(req.wrapping_add(0x20), 0);
+                self.retail_completions.push(req);
+                1
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    fn retail_open(&mut self, mode: u32, path_ptr: u32, req: u32) -> u32 {
+        let path = self.try_read_c_string(path_ptr, 256).unwrap_or_default();
+        let object = self.read_guest_u32(req.wrapping_add(0x08)).unwrap_or(0);
+        let buf = self.read_guest_u32(req.wrapping_add(0x14)).unwrap_or(0);
+        let len = self.read_guest_u32(req.wrapping_add(0x18)).unwrap_or(0);
+        let host_path = self.resolve_bundle_path(&path);
+        if let Some(host_path) = host_path.as_deref() {
+            self.note_audio_asset_path(host_path);
+        }
+        let Some(stream) = host_path.and_then(|host| self.retail_files.open(&host, object)) else {
+            // A missing file is an answer the game handles; it reads the
+            // failure from the status, not from the return value.
+            info!(target: "EAPP_IMPORT", "retail open {:?} req={:#010x} -> missing", path, req);
+            self.write_guest_u32(req.wrapping_add(0x20), u32::MAX);
+            self.retail_completions.push(req);
+            return 0;
+        };
+        self.write_guest_u32(req.wrapping_add(0x2c), stream);
+        let result = if buf != 0 && len != 0 {
+            // An open that carries a buffer is a load, header-sized ones
+            // included: Bowling probes each `.wav` with a 44-byte buffer and
+            // its audio loader stalls if that header is not filled. A
+            // write-mode open moves nothing in.
+            let got = if mode & 0xff == 1 {
+                0
+            } else {
+                let bytes = self.retail_files.read(stream, len);
+                self.retail_files.rewind(stream);
+                let _ = self.write_guest_bytes(buf, &bytes);
+                bytes.len() as u32
+            };
+            self.write_guest_u32(req.wrapping_add(0x24), got);
+            got
+        } else {
+            // A bufferless open answers how big the file is. Bowling's open
+            // completion stores `[object+8]` as the resource size and refuses
+            // any resource shorter than four bytes.
+            self.retail_files.len(stream)
+        };
+        if object != 0 {
+            self.write_guest_u32(object.wrapping_add(8), result);
+        }
+        self.write_guest_u32(req.wrapping_add(0x20), 0);
+        self.retail_completions.push(req);
+        info!(
+            target: "EAPP_IMPORT",
+            "retail open {:?} mode={} req={:#010x} obj={:#010x} buf={:#010x} len={} -> stream {} result={}",
+            path, mode & 0xff, req, object, buf, len, stream, result
+        );
+        stream
+    }
+
+    fn retail_transfer(&mut self, req: u32) -> u32 {
+        let op = self.read_guest_u8(req.wrapping_add(0x04)).unwrap_or(0);
+        let object = self.read_guest_u32(req.wrapping_add(0x08)).unwrap_or(0);
+        let buf = self.read_guest_u32(req.wrapping_add(0x14)).unwrap_or(0);
+        let len = self.read_guest_u32(req.wrapping_add(0x18)).unwrap_or(0);
+        let stream_field = self.read_guest_u32(req.wrapping_add(0x2c)).unwrap_or(0);
+        let stream = self.retail_files.stream_for(object, stream_field);
+        let got = match stream {
+            None => 0,
+            Some(s) if op == 5 => {
+                let offset = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0) as i32;
+                let whence = self.read_guest_u8(req.wrapping_add(0x10)).unwrap_or(0);
+                let at = self.retail_files.seek(s, offset, whence);
+                self.write_guest_u32(req.wrapping_add(0x28), at);
+                0
+            }
+            // Without a buffer, a length is a skip past a header.
+            Some(s) if op != 4 && buf == 0 && len > 0 => self.retail_files.skip(s, len),
+            Some(s) => {
+                let bytes = self.retail_files.read(s, len);
+                let _ = self.write_guest_bytes(buf, &bytes);
+                let at = self.retail_files.pos(s);
+                self.write_guest_u32(req.wrapping_add(0x28), at);
+                bytes.len() as u32
+            }
+        };
+        // The byte count is how far the game advances its resource cursor:
+        // Bowling's read completion copies `+0x24` into the stream and
+        // re-fetches the same chunk forever if it reads zero.
+        self.write_guest_u32(req.wrapping_add(0x24), got);
+        if object != 0 {
+            self.write_guest_u32(object.wrapping_add(8), got);
+        }
+        let ok = op == 5 || len == 0 || (got == len && got > 0);
+        self.write_guest_u32(req.wrapping_add(0x20), if ok { 0 } else { u32::MAX });
+        self.retail_completions.push(req);
+        debug!(
+            target: "EAPP_IMPORT",
+            "retail op {} req={:#010x} stream={:?} buf={:#010x} len={} -> {}",
+            op, req, stream, buf, len, got
+        );
+        // A seek moved no bytes but succeeded; a zero return reads as
+        // failure and the resource library re-asks every frame.
+        if got > 0 {
+            got
+        } else {
+            (op == 5) as u32
+        }
+    }
+
+    /// Hand each finished RetailOS operation to its completion callback as
+    /// `(request, [request+0x38])`. The callback is read now rather than when
+    /// the operation started, because the game reuses request objects.
+    fn queue_retail_completions(&mut self) {
+        for req in std::mem::take(&mut self.retail_completions) {
+            let pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
+            if pc == 0 {
+                continue;
+            }
+            let ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
+            self.pending_guest_calls.push_back(PendingGuestCall {
+                pc,
+                arg0: req,
+                arg1: ctx,
+                arg2: 0,
+                arg3: 0,
+            });
+        }
+    }
+
     fn handle_async_file_io_import(&mut self, ordinal: u32, args: [u32; 4]) -> u32 {
+        if self.is_sims_engine() {
+            if let Some(result) = self.handle_retail_async_file_io(ordinal, args) {
+                return result;
+            }
+        }
         if ordinal == 9 {
             let handle = args[0];
             let buffer = args[1];
@@ -8515,8 +8717,6 @@ impl Eapp {
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
             let is_sudoku = self.metadata.title == "50513"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
             let is_royal = self.metadata.title == "50514"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
             let is_mspacman = self.metadata.title == "14004"
@@ -8545,10 +8745,6 @@ impl Eapp {
                 && std::env::var("EAPP_SUDOKU_ASYNC1_COMPLETE")
                     .map(|v| v == "1" || v == "true")
                     .unwrap_or(false);
-            let sims_complete = is_sims
-                && fliwheel_var("EAPP_SIMS_ASYNC1_COMPLETE")
-                    .map(|v| v == "1" || v == "true")
-                    .unwrap_or(false);
             let royal_complete = is_royal
                 && fliwheel_var("EAPP_ROYAL_ASYNC1_COMPLETE")
                     .map(|v| v == "1" || v == "true")
@@ -8571,7 +8767,6 @@ impl Eapp {
                 (complete && is_tetris
                     || texas_complete
                     || sudoku_complete
-                    || sims_complete
                     || royal_complete
                     || mspacman_complete
                     || is_lost) as u8
@@ -8603,22 +8798,6 @@ impl Eapp {
                     callback_ctx
                 );
                 return 1;
-            }
-            if is_sims {
-                info!(
-                    target: "EAPP_IMPORT",
-                    "AsyncFileIO:1 Sims owner_fields owner={:#010x} op={} offset={:#010x} mode={:#010x} dest={:#010x} want={:#010x} status={:#010x} bytes={:#010x} result={:#010x} payload={:#010x}",
-                    owner,
-                    self.read_guest_u8(owner.wrapping_add(0x04)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x0c)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x10)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x14)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x18)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x20)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x24)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x28)).unwrap_or(0),
-                    self.read_guest_u32(owner.wrapping_add(0x2c)).unwrap_or(0),
-                );
             }
             if complete && is_tetris && owner != 0 && req != 0 {
                 // Ordinal 1 is a no-path/control completion used by initiator C
@@ -8714,35 +8893,6 @@ impl Eapp {
                 info!(
                     target: "EAPP_IMPORT",
                     "AsyncFileIO:1 Sudoku completion owner={:#010x} cb_pc={:#010x} status={} bytes={}",
-                    owner,
-                    owner_internal_cb,
-                    status,
-                    byte_count
-                );
-            }
-            if sims_complete && owner != 0 && owner_internal_cb != 0 {
-                let status = fliwheel_var("EAPP_SIMS_ASYNC1_STATUS")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(1);
-                let byte_count = fliwheel_var("EAPP_SIMS_ASYNC1_BYTES")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(0);
-                self.write_guest_u32(owner.wrapping_add(0x20), status);
-                self.write_guest_u32(owner.wrapping_add(0x24), byte_count);
-                let _ = self.write_guest_bytes(owner.wrapping_add(0x1c), &[0]);
-                self.async_callback_queued_count = self.async_callback_queued_count.wrapping_add(1);
-                self.pending_guest_calls.push_back(PendingGuestCall {
-                    pc: owner_internal_cb,
-                    arg0: owner,
-                    arg1: owner_internal_ctx,
-                    arg2: 0,
-                    arg3: 0,
-                });
-                info!(
-                    target: "EAPP_IMPORT",
-                    "AsyncFileIO:1 Sims completion owner={:#010x} cb_pc={:#010x} status={} bytes={}",
                     owner,
                     owner_internal_cb,
                     status,
@@ -8894,8 +9044,6 @@ impl Eapp {
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
             let is_sudoku = self.metadata.title == "50513"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
             let is_royal = self.metadata.title == "50514"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
             let is_mspacman = self.metadata.title == "14004"
@@ -8928,10 +9076,6 @@ impl Eapp {
                 && std::env::var("EAPP_SUDOKU_ASYNC2_COMPLETE")
                     .map(|v| v == "1" || v == "true")
                     .unwrap_or(false);
-            let sims_complete = is_sims
-                && fliwheel_var("EAPP_SIMS_ASYNC2_COMPLETE")
-                    .map(|v| v == "1" || v == "true")
-                    .unwrap_or(false);
             let royal_complete = is_royal
                 && fliwheel_var("EAPP_ROYAL_ASYNC2_COMPLETE")
                     .map(|v| v == "1" || v == "true")
@@ -8953,7 +9097,6 @@ impl Eapp {
                 (complete && is_tetris
                     || texas_complete
                     || sudoku_complete
-                    || sims_complete
                     || royal_complete
                     || mspacman_complete
                     || mahjong_complete
@@ -9303,7 +9446,6 @@ impl Eapp {
                     || is_sat
                     || is_iquiz
                     || sudoku_complete
-                    || sims_complete
                     || royal_complete
                     || mspacman_complete;
             if title_async2_complete && owner != 0 && callback_pc != 0 {
@@ -9313,7 +9455,7 @@ impl Eapp {
                 // this AsyncFileIO:2 wrapper; it compares them and then
                 // consumes owner+0x20 as the completion status.
                 let owner_op = self.read_guest_u8(owner.wrapping_add(0x04)).unwrap_or(0);
-                if (sudoku_complete || sims_complete) && owner_op == 5 {
+                if sudoku_complete && owner_op == 5 {
                     // Sudoku's 0x1801b14c path is a seek before the following
                     // type-3 payload read. The guest passes the absolute RLB
                     // position in owner+0x0c; keep the staged host image at
@@ -9405,8 +9547,6 @@ impl Eapp {
                     "AsyncFileIO:2 {} completion owner={:#010x} cb_pc={:#010x}",
                     if sudoku_complete {
                         "Sudoku"
-                    } else if sims_complete {
-                        "Sims"
                     } else if royal_complete {
                         "Royal"
                     } else if mspacman_complete {
@@ -9482,9 +9622,10 @@ impl Eapp {
                 // callback is supplied by the guest in owner+0x34; it is not a
                 // fixed address because every EAPP binary has its own code
                 // layout. Keep whole-file completion title-scoped: Tetris,
-                // Texas Hold'em, Royal Solitaire, Sudoku, Mahjong, and The
-                // Sims remain opt-in, while Ms. PAC-MAN's measured contract is
-                // enabled by default. LOST follows the PR #3 direct-runner
+                // Texas Hold'em, Royal Solitaire, Sudoku, and Mahjong remain
+                // opt-in, while Ms. PAC-MAN's measured contract is enabled by
+                // default (the Sims never reach this path; see
+                // `handle_retail_async_file_io`). LOST follows the PR #3 direct-runner
                 // contract too:
                 // its options.sav probe completes and invokes the owner
                 // callback before the render loop can advance to the next
@@ -9498,8 +9639,6 @@ impl Eapp {
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
                 let is_sudoku = self.metadata.title == "50513"
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-                let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
                 let is_royal = self.metadata.title == "50514"
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
                 let is_mspacman = self.metadata.title == "14004"
@@ -9524,10 +9663,6 @@ impl Eapp {
                     && std::env::var("EAPP_SUDOKU_ASYNC0_COMPLETE")
                         .map(|v| v == "1" || v == "true")
                         .unwrap_or(false);
-                let sims_complete = is_sims
-                    && fliwheel_var("EAPP_SIMS_ASYNC0_COMPLETE")
-                        .map(|v| v == "1" || v == "true")
-                        .unwrap_or(false);
                 let royal_complete = is_royal
                     && fliwheel_var("EAPP_ROYAL_ASYNC0_COMPLETE")
                         .map(|v| v == "1" || v == "true")
@@ -9547,7 +9682,6 @@ impl Eapp {
                     || tetris_complete
                     || texas_complete
                     || sudoku_complete
-                    || sims_complete
                     || royal_complete
                     || mspacman_complete
                     || mahjong_complete;
@@ -9610,8 +9744,8 @@ impl Eapp {
                         // completion notification. The guest owner callback
                         // copies [owner+0x2c] into [request+0] before it calls
                         // the request callback; that pointer is the loaded
-                        // RLB/WAV payload. Keep the payload in synthetic app
-                        // RAM for the guest to parse after completion.
+                        // RLB/WAV payload. Keep the payload in guest RAM for
+                        // the guest to parse after completion.
                         // Parsed-resource startup can reopen the same RLB for
                         // several stream objects. Reuse an existing staged
                         // image instead of consuming another 16 MiB guest-RAM
@@ -9624,7 +9758,7 @@ impl Eapp {
                             .map(|staged| (staged.payload_addr, staged.offset));
                         let payload_addr = existing_stage
                             .map(|(payload_addr, _)| payload_addr)
-                            .unwrap_or_else(|| self.alloc_zeroed(n));
+                            .unwrap_or_else(|| self.alloc_staged_payload(n));
                         let payload_offset = if is_mahjong {
                             // A new RetailOS open starts at offset zero even if
                             // the host-side staged image is reused.
@@ -9775,45 +9909,6 @@ impl Eapp {
                                 mahjong_handle.unwrap_or(0),
                                 object
                             );
-                        }
-                        // The Sims preload reuses the owner/context object that
-                        // handled the initial save-file probe. Retail clears most
-                        // of that object's request fields before opening
-                        // gameLib.rlb, but the observed callback reads +0x174 as
-                        // the resource result. Keep a title-scoped override for
-                        // testing the pointer-valued resource handle without
-                        // changing the default HLE path.
-                        if sims_complete {
-                            if let Some(result_spec) =
-                                fliwheel_var_os("EAPP_SIMS_ASYNC0_OWNER_RESULT")
-                            {
-                                let result_spec = result_spec.to_string_lossy();
-                                let result = if result_spec == "length" {
-                                    Some(n)
-                                } else if result_spec == "payload" {
-                                    Some(payload_addr)
-                                } else if let Some(hex) = result_spec.strip_prefix("0x") {
-                                    u32::from_str_radix(hex, 16).ok()
-                                } else {
-                                    result_spec.parse::<u32>().ok()
-                                };
-                                let request =
-                                    self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
-                                let resource_context = request.checked_sub(0x16c).unwrap_or(0);
-                                if let (Some(result), true) = (result, resource_context != 0) {
-                                    self.write_guest_u32(
-                                        resource_context.wrapping_add(0x174),
-                                        result,
-                                    );
-                                    info!(
-                                        target: "EAPP_IMPORT",
-                                        "AsyncFileIO:0 Sims owner result override owner={:#010x} context={:#010x} result={:#010x}",
-                                        owner,
-                                        resource_context,
-                                        result
-                                    );
-                                }
-                            }
                         }
                         // Royal Solitaire's RLB preload uses the same
                         // manager callback shape, but its guest callback
@@ -10048,18 +10143,6 @@ impl Eapp {
                                 bytes.len()
                             };
                             let n = bytes.len().min(requested_len);
-                            let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
-                                || self
-                                    .metadata
-                                    .bundle_dir
-                                    .to_str()
-                                    .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
-                            let zero_fill_sims_rserver = is_sims
-                                && fliwheel_var_os("EAPP_SIMS_ZERO_FILL_RSERVER").is_some()
-                                && host_path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .map_or(false, |name| name == "rserver.bin");
                             // Request-object reads provide a destination and a capacity; the
                             // firmware copies the bytes actually read and reports the byte count.
                             // Do NOT zero-fill the full requested capacity here. Texas Hold'em
@@ -10079,21 +10162,6 @@ impl Eapp {
                             let bytes_delivered = should_deliver
                                 && dest != 0
                                 && self.write_guest_bytes(dest, &bytes[..n]);
-                            if bytes_delivered && zero_fill_sims_rserver && requested_len > n {
-                                let padding = vec![0u8; requested_len - n];
-                                let padding_delivered = self.write_guest_bytes(
-                                    dest.wrapping_add(n as u32),
-                                    &padding,
-                                );
-                                info!(
-                                    target: "EAPP_IMPORT",
-                                    "AsyncFileIO:3 Sims rserver zero-fill requested={} file_bytes={} padding={} delivered={}",
-                                    requested_len,
-                                    n,
-                                    padding.len(),
-                                    padding_delivered
-                                );
-                            }
                             let delivered = dest != 0 && (bytes_delivered || !should_deliver);
                             if delivered {
                                 // The async completion callback `0x1801fc68`
@@ -10817,58 +10885,6 @@ impl Eapp {
         self.drain_watch_log();
     }
 
-    /// The Sims frame loop waits for a title-specific input-manager status byte
-    /// to become zero before it leaves its resource-loading state. The retail
-    /// image initializes that byte to 2, while the currently emulated input
-    /// path does not produce the observed completion write.
-    /// Keep a one-shot override behind an explicit, Sims-only probe flag so
-    /// default execution remains unchanged while the next scene contract is
-    /// investigated.
-    fn maybe_apply_sims_input_ready(&mut self) {
-        let is_sims = matches!(self.metadata.title.as_str(), "1500C" | "1500E")
-            || self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .map_or(false, |p| p.contains("1500C") || p.contains("1500E"));
-        let enabled = is_sims
-            && fliwheel_var("EAPP_SIMS_INPUT_READY")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false);
-        if !enabled {
-            return;
-        }
-
-        let start_frame = fliwheel_var("EAPP_SIMS_INPUT_READY_FRAME")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if self.frame_counter < start_frame {
-            return;
-        }
-
-        let input_status = match self.metadata.title.as_str() {
-            // Bowling's input manager global.
-            "1500C" => 0x1807_380c,
-            // Pool is a relocated build; its matching input-manager global
-            // is referenced by the same shared helper at 0x180051b4.
-            "1500E" => 0x1808_5bac,
-            _ => return,
-        };
-        let before = self.read_guest_u8(input_status).unwrap_or(0xff);
-        if before == 2 {
-            let wrote = self.write_guest_bytes(input_status, &[0]);
-            info!(
-                target: "EAPP",
-                "Sims input readiness probe title={} addr={:#010x} status={:#04x} -> 0 wrote={}",
-                self.metadata.title,
-                input_status,
-                before,
-                wrote
-            );
-        }
-    }
-
     fn render_state_hash(&self) -> u64 {
         let frame = self.render_state.lock().unwrap();
         let mut hasher = DefaultHasher::new();
@@ -11050,9 +11066,9 @@ impl Eapp {
                         self.cpu.reg_get(self.cpu.mode(), 0)
                     );
                 }
-                self.maybe_apply_sims_input_ready();
                 self.maybe_log_startup_progress();
                 self.frame_import_counts.clear();
+                self.queue_retail_completions();
                 if !self.dispatch_pending_guest_call() {
                     self.queue_next_frame();
                 }
@@ -11088,7 +11104,7 @@ impl Eapp {
     }
 
     fn queue_next_frame(&mut self) {
-        let frame_context = if self.metadata.title == "1B200" {
+        let frame_context = if self.metadata.title == "1B200" || self.is_sims_engine() {
             // PR #3 measures RetailOS passing one manager object in r0 and
             // its frame context at manager+0x100 in r1 for LOST. Keep the
             // established independent context used by the other titles.
@@ -11111,6 +11127,19 @@ impl Eapp {
                 _ => 1,
             };
             let _ = self.write_guest_bytes(self.app_object, &[reason]);
+        }
+        if self.is_sims_engine() {
+            // The Sims dispatcher at 0x18045744 reads the reason at [r0]:
+            // 0 runs the full application init and answers 1 at [r1], 1 runs
+            // a frame, and 5 is the suspend/resume path. Like RetailOS, ask
+            // for init until the game has answered, then ask for frames. A
+            // constant 0 rebuilds the game every frame until its heap runs
+            // out; a constant 5 strands it in suspend/resume.
+            let answered = self
+                .read_guest_u8(self.app_object.wrapping_add(0x100))
+                .unwrap_or(0)
+                != 0;
+            let _ = self.write_guest_bytes(self.app_object, &[answered as u8]);
         }
         self.cpu.reg_set(self.cpu.mode(), 0, self.app_object);
         self.cpu.reg_set(self.cpu.mode(), 1, frame_context);
@@ -11218,6 +11247,22 @@ impl Eapp {
         let ptr = block + 8;
         self.alloc_sizes.insert(ptr, size);
         ptr
+    }
+
+    /// Allocate the guest copy of a staged whole-file load. Low work RAM has
+    /// only ~24 MiB between the allocator start and the guest stack below
+    /// `STACK_TOP`, so a large bundle file (Sims' 20 MB `gameLib.rlb`) staged
+    /// there overwrote the live stack. Stage payloads in the RetailOS heap
+    /// instead. LOST and Vortex use that heap as their own malloc arena with
+    /// address-sensitive layouts, so they keep their low work-RAM staging.
+    fn alloc_staged_payload(&mut self, len: u32) -> u32 {
+        if matches!(self.metadata.title.as_str(), "1B200" | "12345") {
+            self.alloc_zeroed(len)
+        } else {
+            // An empty file still gets its own block, so its pointer does not
+            // alias the next block's size header.
+            self.alloc_game_heap(len.max(1))
+        }
     }
 
     fn read_guest_u8(&mut self, addr: u32) -> Option<u8> {

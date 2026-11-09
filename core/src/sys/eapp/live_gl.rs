@@ -507,16 +507,23 @@ impl LiveGlState {
         // Most titles redraw a complete scene every frame. Tetris instead
         // submits only changed cells after its initial board composition, Vortex's
         // transition/menu frames overlay partial scenes without issuing a clear,
-        // and SAT Prep (11050/11051/11052) only redraws cursor/status bar updates
-        // during idle menu input. Those GL surfaces must retain prior pixels until
-        // the guest explicitly clears them.
-        if !matches!(self.game_id.as_str(), "66666" | "12345" | "11050" | "11051" | "11052") {
+        // SAT Prep (11050/11051/11052) only redraws cursor/status bar updates
+        // during idle menu input, and the Sims Bowling/Pool menus redraw only
+        // the clock, the highlight and other changed regions. Those GL
+        // surfaces must retain prior pixels until the guest explicitly clears
+        // them.
+        let retains_surface = self.retains_surface();
+        if !retains_surface {
             self.framebuffer = vec![Rgba8::rgba(0, 0, 0, 0); FB_PIXELS];
         }
         self.draws.clear();
         self.draw_count_in_frame = 0;
         self.ordinal_trace.clear();
-        self.ndc_frame = false;
+        // A retained surface keeps the orientation it was drawn in, including
+        // through frames that draw nothing.
+        if !retains_surface {
+            self.ndc_frame = false;
+        }
         // Scalar-formatter char sequences are rebuilt by the guest each frame,
         // so drop the prior frame's recorded pushes+consumption.
         self.text_char_seqs.clear();
@@ -536,6 +543,12 @@ impl LiveGlState {
         if mask & GL_COLOR_BUFFER_BIT != 0 {
             self.framebuffer.fill(self.clear_color);
         }
+    }
+
+    fn retains_surface(&self) -> bool {
+        matches!(self.game_id.as_str(), "66666" | "12345" | "11050" | "11051" | "11052")
+            || self.game_id.eq_ignore_ascii_case("1500c")
+            || self.game_id.eq_ignore_ascii_case("1500e")
     }
 
     fn uses_ndc_coordinates(&self, positions: &[(f32, f32)]) -> bool {
