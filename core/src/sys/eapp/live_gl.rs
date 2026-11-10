@@ -167,6 +167,9 @@ pub struct LiveArrayDef {
     pub guest_ptr: u32,
     pub valid: bool,
     pub material_epoch: u64,
+    /// `LiveGlState::draw_seq` when the guest specified this array: how many
+    /// DrawArrays/DrawElements calls preceded it.
+    pub draw_seq: u64,
 }
 
 /// One decoded ordinal-37 draw, recorded for diagnostics and comparison.
@@ -241,6 +244,9 @@ pub struct LiveGlState {
     pub current_handle: u32,
     pub current_state_ptr: u32,
     pub current_material_epoch: u64,
+    /// Count of guest DrawArrays/DrawElements calls (ordinals 37/38), used to
+    /// tell which client arrays were specified for the same draw batch.
+    pub draw_seq: u64,
     pub translation: (f32, f32),
     /// Rotation and scale composed into the 2D draw transform by
     /// OpenGLES:173/171, column-major `[a, b, c, d]`: a vertex `(x, y)` lands
@@ -369,6 +375,7 @@ impl LiveGlState {
             current_handle: 0,
             current_state_ptr: 0,
             current_material_epoch: 0,
+            draw_seq: 0,
             translation: (0.0, 0.0),
             linear: IDENTITY_LINEAR,
             mvp: None,

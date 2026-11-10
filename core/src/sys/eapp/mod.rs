@@ -3019,10 +3019,12 @@ impl Eapp {
             }
             37 => {
                 self.live_handle_draw(args);
+                self.live_note_draw_issued();
                 0
             }
             38 => {
                 self.live_handle_draw_elements(args);
+                self.live_note_draw_issued();
                 0
             }
             45 => {
@@ -4114,6 +4116,7 @@ impl Eapp {
                 guest_ptr,
                 valid,
                 material_epoch: lg.current_material_epoch,
+                draw_seq: lg.draw_seq,
             };
             lg.arrays.insert(array_index, def);
             if valid {
@@ -4201,10 +4204,31 @@ impl Eapp {
         let uv_enabled = uv
             .as_ref()
             .is_some_and(|def| lg.enabled_arrays.contains(&def.array_index));
-        let color_enabled = colors
-            .as_ref()
-            .is_some_and(|def| lg.enabled_arrays.contains(&def.array_index));
+        // A colour array left over from an earlier draw batch is not part of
+        // this one, even while its enable bit stays latched: when the guest
+        // respecifies the position array after a draw but leaves the colour
+        // array alone, the colour pointer still describes the previous
+        // batch's buffer. Hold'em's loading spinner defines arrays 0/1/2
+        // (stride 40, 11 vertices) and draws; its text pass then redefines
+        // only arrays 0/1, sets a uniform colour (OpenGLES:148) and draws 40
+        // glyph vertices. Reading array 2 there walks past the spinner's
+        // buffer into the heap, so most glyphs got zero alpha.
+        let position_seq = lg
+            .arrays
+            .get(&0)
+            .filter(|def| def.valid)
+            .map(|def| def.draw_seq);
+        let color_enabled = colors.as_ref().is_some_and(|def| {
+            lg.enabled_arrays.contains(&def.array_index)
+                && position_seq.is_none_or(|seq| def.draw_seq >= seq)
+        });
         (uv, uv_enabled, colors, color_enabled)
+    }
+
+    fn live_note_draw_issued(&mut self) {
+        if let Some(lg) = self.live_gl.as_mut() {
+            lg.draw_seq = lg.draw_seq.wrapping_add(1);
+        }
     }
 
     /// Ordinal 40: enable/select an array by index (direct arg r0 only).
