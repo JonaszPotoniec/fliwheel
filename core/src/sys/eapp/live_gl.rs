@@ -1807,9 +1807,12 @@ impl LiveGlState {
     /// The shared rasterizer ignores vertex-colour alpha. The TWA engine
     /// (iQuiz, SAT Prep) fades text through it: Music Quiz 2 draws its
     /// "Time's Up!" banner every frame with alpha 0 until the timer runs out.
+    /// Vortex (12345) draws its ball trail as four earlier ball positions with
+    /// vertex alpha 0.15, 0.31, 0.46 and 0.61 before the opaque ball; drawn
+    /// opaque they read as a string of extra balls.
     /// For those titles, scale the tint alpha by the mean vertex alpha.
     fn with_vertex_alpha(&self, tint: Rgba8, vertex_colors: Option<&[[f32; 4]]>) -> Rgba8 {
-        if !matches!(self.game_id.as_str(), "11002" | "11050" | "11051" | "11052") {
+        if !matches!(self.game_id.as_str(), "11002" | "11050" | "11051" | "11052" | "12345") {
             return tint;
         }
         let Some(colors) = vertex_colors.filter(|colors| !colors.is_empty()) else {
@@ -2648,6 +2651,16 @@ mod tests {
         vortex.framebuffer[0] = Rgba8::rgba(70, 80, 90, 255);
         vortex.reset_for_frame();
         assert_eq!(vortex.framebuffer[0], Rgba8::rgba(70, 80, 90, 255));
+    }
+
+    #[test]
+    fn vortex_ball_trail_uses_vertex_alpha() {
+        let white = Rgba8::rgba(255, 255, 255, 255);
+        let trail = [[1.0, 1.0, 1.0, 0.305]; 4];
+        let vortex = LiveGlState::new(true, false, false, "12345".to_string());
+        assert_eq!(vortex.with_vertex_alpha(white, Some(&trail)).a, 78);
+        let tetris = LiveGlState::new(true, false, false, "66666".to_string());
+        assert_eq!(tetris.with_vertex_alpha(white, Some(&trail)), white);
     }
 
     #[test]
