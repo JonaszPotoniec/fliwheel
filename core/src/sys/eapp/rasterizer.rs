@@ -724,7 +724,10 @@ pub fn rasterize_triangle_tinted_with_vertex_colors(
                         (out[0] * 255.0).round() as u8,
                         (out[1] * 255.0).round() as u8,
                         (out[2] * 255.0).round() as u8,
-                        255,
+                        // GL_MODULATE multiplies texture alpha by the primary
+                        // colour alpha. Vortex fades its ball trail and the
+                        // TWA engine its text this way.
+                        (out[3] * 255.0).round() as u8,
                     );
                     modulate(modulate(sample, primary), tint)
                 }
@@ -946,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn textured_vertex_alpha_does_not_reduce_texture_coverage() {
+    fn textured_vertex_alpha_modulates_texture_alpha() {
         let tex = Texture::from_bytes(
             &[0x00, 0xff, 0x00, 0xff],
             1,
@@ -954,7 +957,7 @@ mod tests {
             TextureFormat::Rgba8888,
             Rgba8::rgba(255, 255, 255, 255),
         );
-        let mut fb = vec![Rgba8::rgba(0, 0, 0, 0)];
+        let mut fb = vec![Rgba8::rgba(255, 0, 0, 255)];
         let colors = [[1.0, 1.0, 1.0, 0.25]; 4];
         let cov = rasterize_quad_tinted_with_vertex_colors(
             &mut fb,
@@ -967,7 +970,8 @@ mod tests {
             Some(&colors),
         );
         assert_eq!(cov, 1);
-        assert_eq!(fb[0], Rgba8::rgba(0, 255, 0, 255));
+        // A quarter of the green texel over the opaque red background.
+        assert_eq!(fb[0], Rgba8::rgba(191, 64, 0, 255));
     }
 
     #[test]
