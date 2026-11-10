@@ -235,6 +235,10 @@ const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
 /// reference model also documents `0x14000000..0x18000000` as an uncached
 /// SDRAM alias; `FLIWHEEL_EAPP_UNCACHED_ALIAS=1` selects that A/B path.
 const HW_STUB_BASE: u32 = 0x1400_0000;
+/// Internal name for GL's default texture object (name 0) in TWA titles.
+const DEFAULT_TEXTURE_NAME: u32 = 0x7fff_0000;
+/// Guest addresses below this read as zero when `zero_null_page_reads` is set.
+const NULL_PAGE_SIZE: u32 = 0x1000;
 const HW_STUB_SIZE: usize = 0x400_0000; // 64 MiB - covers entire 0x14000000..0x18000000 gap
                                         // (DMA channel register banks at 64KB strides: 0x14000000, 0x14010000, 0x14020000, etc.)
 
@@ -772,6 +776,13 @@ pub struct Eapp {
     /// retain enough allocator metadata to preserve the old bytes and grow
     /// the common top-of-heap block in place.
     alloc_sizes: HashMap<u32, u32>,
+    /// Colour uniform (OpenGLES:148/120/147, location 4) last set while each
+    /// material was bound, for the TWA engine (iQuiz, SAT Prep). Uniforms
+    /// belong to a program, so a value set for one material must not tint
+    /// the next. iQuiz gives only its slider material a colour, an all-zero
+    /// one, and every later draw in the frame (pack name, icons) inherited
+    /// alpha 0 and was dropped.
+    material_colors: HashMap<u32, Rgba8>,
     game_heap_next: u32,
     bootstrap_phase: BootstrapPhase,
     app_object: u32,
@@ -985,6 +996,12 @@ struct EappBus {
     /// keep it title-scoped until the same contract is verified for every
     /// decrypted eApp.
     zero_unmapped_reads: bool,
+    /// Read the null page as zeros. On the iPod low memory is mapped, so a
+    /// read through a null pointer returns bytes instead of faulting. iQuiz
+    /// relies on it: its idle-quit save copies the player name with
+    /// `strcpy(buf, name.c_str())`, and before a name is entered that
+    /// pointer is null (fault at 0x18001c18).
+    zero_null_page_reads: bool,
     /// PR #3's direct HLE runner also makes stores to an unmapped address a
     /// no-op. Keep this opt-in for the Vortex A/B because the existing
     /// surface workaround intentionally relies on mapped backing storage.
@@ -1129,6 +1146,10 @@ impl Eapp {
     pub fn from_image(image: EappImage) -> Result<Eapp, EappBuildError> {
         let game_id = image.metadata.title.replace(' ', "_").to_ascii_lowercase();
         let zero_unmapped_reads = image.metadata.title == "12345";
+        let zero_null_page_reads = matches!(
+            image.metadata.title.as_str(),
+            "11002" | "11050" | "11051" | "11052"
+        );
         let zero_unmapped_writes = image.metadata.title == "12345"
             && fliwheel_var_os("VORTEX_PR3_GL165").is_some();
         let render_state = Arc::new(Mutex::new(vec![DEFAULT_FRAMEBUFFER; SCREEN_PIXELS]));
@@ -1199,6 +1220,7 @@ impl Eapp {
                 game_heap,
                 dma_framebuf: Ram::new(320 * 240 * 2), // RGB565 320×240
                 zero_unmapped_reads,
+                zero_null_page_reads,
                 zero_unmapped_writes,
                 uncached_sdram_alias: fliwheel_var_os("EAPP_UNCACHED_ALIAS").is_some(),
                 hw_control_value: Self::parse_hw_control_value_env(),
@@ -1252,6 +1274,7 @@ impl Eapp {
             next_alloc: WORK_RAM_BASE + 0x1000,
             next_texture_name: 0,
             alloc_sizes: HashMap::new(),
+            material_colors: HashMap::new(),
             game_heap_next: GAME_HEAP_BASE,
             bootstrap_phase: BootstrapPhase::Entry,
             app_object: 0,
@@ -3292,7 +3315,16 @@ impl Eapp {
             // PopCap loads several textures through this bind-before-upload
             // sequence and reuses the same material handles across them.
             4 => {
-                let tex_name = args[1];
+                // Texture 0 is GL's default texture object, not "unbound".
+                // The TWA engine draws its question screens in software and
+                // uploads them into texture 0 (TexImage2D, then TexSubImage2D
+                // every frame); give it a name of its own so those uploads
+                // are kept and sampled. Other titles keep 0 as unbound.
+                let tex_name = if args[1] == 0 && self.is_twa_engine() {
+                    DEFAULT_TEXTURE_NAME
+                } else {
+                    args[1]
+                };
                 if let Some(lg) = self.live_gl.as_mut() {
                     // Keep the bind live after the upload. `pending_tex_name`
                     // is consumed by the next TexImage2D, while this state
@@ -4526,6 +4558,11 @@ impl Eapp {
         debug!(target: "EAPP_GL", "live_clear mask={:#x}", mask);
     }
 
+    /// iQuiz and the SAT Prep titles share the TWA engine.
+    fn is_twa_engine(&self) -> bool {
+        matches!(self.metadata.title.as_str(), "11002" | "11050" | "11051" | "11052")
+    }
+
     fn live_set_uniform_color(&mut self, location: i32, values: [f32; 4]) {
         if location != 4 {
             return;
@@ -4537,8 +4574,12 @@ impl Eapp {
             to_u8(values[2]),
             to_u8(values[3]),
         );
+        let twa = self.is_twa_engine();
         if let Some(lg) = self.live_gl.as_mut() {
             lg.set_modulate(color);
+            if twa {
+                self.material_colors.insert(lg.current_handle, color);
+            }
         }
         debug!(
             target: "EAPP_GL",
@@ -4619,6 +4660,14 @@ impl Eapp {
             lg.current_handle = handle;
             lg.current_state_ptr = state_ptr;
             lg.current_material_epoch = lg.current_material_epoch.wrapping_add(1);
+            if matches!(lg.game_id.as_str(), "11002" | "11050" | "11051" | "11052") {
+                let color = self
+                    .material_colors
+                    .get(&handle)
+                    .copied()
+                    .unwrap_or(Rgba8::rgba(255, 255, 255, 255));
+                lg.set_modulate(color);
+            }
             // A material bind starts a fresh transform context for the next
             // draw group. Pointer text glyph loops then carry their own
             // per-glyph translation between draws until the next bind.
@@ -7260,12 +7309,20 @@ impl Eapp {
                 // microsecond units, so expose host monotonic microseconds.
                 self.handle_misc9_time_api(args)
             }
-            2 if self.metadata.title == "12345" => {
+            2 if matches!(
+                self.metadata.title.as_str(),
+                "12345" | "11002" | "11050" | "11051" | "11052"
+            ) =>
+            {
                 // PR #3 binds miscTBD:2 as realloc(old, size). Vortex grows
                 // its localization strings one append at a time; returning
                 // zero leaves every key null and the parser never reaches
                 // the next async asset. Preserve the old prefix and extend
-                // the top allocation in place when possible.
+                // the top allocation in place when possible. The TWA engine
+                // (iQuiz, SAT Prep) grows its strings the same way (string
+                // reserve at 0x1803b5f8): without it "UserTrivia/Packs/" +
+                // pack + "/trivia.txt" kept only the last piece, so every
+                // pack opened a bare "trivia.txt".
                 let old = args[0];
                 let want = args[1];
                 let result = match (old, want) {
@@ -7301,7 +7358,7 @@ impl Eapp {
                 };
                 debug!(
                     target: "EAPP_IMPORT",
-                    "miscTBD:2 Vortex realloc old={:#010x} size={} -> {:#010x}",
+                    "miscTBD:2 realloc old={:#010x} size={} -> {:#010x}",
                     old,
                     want,
                     result
@@ -9773,7 +9830,7 @@ impl Eapp {
                         let payload_addr = existing_stage
                             .map(|(payload_addr, _)| payload_addr)
                             .unwrap_or_else(|| self.alloc_staged_payload(n));
-                        let payload_offset = if is_mahjong {
+                        let payload_offset = if is_mahjong || is_iquiz {
                             // A new RetailOS open starts at offset zero even if
                             // the host-side staged image is reused.
                             0
@@ -13481,6 +13538,7 @@ impl Memory for EappBus {
                 self.trace_watch_read(4, offset, value);
                 Ok(value)
             }
+            o if self.zero_null_page_reads && o < NULL_PAGE_SIZE => Ok(0),
             _ if self.zero_unmapped_reads => Ok(0),
             _ => Err(MemException::Unexpected),
         }
@@ -13594,6 +13652,7 @@ impl Memory for EappBus {
                 self.trace_watch_read(1, offset, value as u32);
                 Ok(value)
             }
+            o if self.zero_null_page_reads && o < NULL_PAGE_SIZE => Ok(0),
             _ if self.zero_unmapped_reads => Ok(0),
             _ => Err(MemException::Unexpected),
         }
@@ -13640,6 +13699,7 @@ impl Memory for EappBus {
                 self.trace_watch_read(2, offset, value as u32);
                 Ok(value)
             }
+            o if self.zero_null_page_reads && o < NULL_PAGE_SIZE => Ok(0),
             _ if self.zero_unmapped_reads => Ok(0),
             _ => Err(MemException::Unexpected),
         }

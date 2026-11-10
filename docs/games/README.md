@@ -23,7 +23,7 @@ older pages retain historical investigation notes and are not completion claims.
 | Bejeweled | 55555 | 🟡 PopCap Classic + two Action matches/timer | [→](55555_bejeweled.md) |
 | Zuma | 44444 | 🟡 Live board + directional aim response; full play open | [→](44444_zuma.md) |
 | Vortex | 12345 | 🟡 Full-color title/name entry + first-level HLE/SFX; pause-save freeze parity; gameplay/pause UI open | [probe](../game_tests/20260829_vortex_copy_lifecycle.md) |
-| iQuiz | 11002 | ❌ Pack discovery/content loading blocked | [→](11002_twa.md) |
+| iQuiz | 11002 | 🟡 Menus render, packs load | [→](11002_twa.md) |
 | SAT Prep Reading | 11050 | 🟡 Coherent splash/spinner; content handoff open | [SAT checkpoint](../game_tests/20260827_sat_loader_and_tetris_audio.md) |
 | SAT Prep Writing | 11051 | 🟡 Coherent splash/spinner; content handoff open | [SAT checkpoint](../game_tests/20260827_sat_loader_and_tetris_audio.md) |
 | SAT Prep Mathematics | 11052 | 🟡 Coherent splash/spinner; content handoff open | [SAT checkpoint](../game_tests/20260827_sat_loader_and_tetris_audio.md) |
