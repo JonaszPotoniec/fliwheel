@@ -238,7 +238,7 @@ const WORK_RAM_SIZE: usize = 64 * 1024 * 1024;
 /// reference model also documents `0x14000000..0x18000000` as an uncached
 /// SDRAM alias; `FLIWHEEL_EAPP_UNCACHED_ALIAS=1` selects that A/B path.
 const HW_STUB_BASE: u32 = 0x1400_0000;
-/// Internal name for GL's default texture object (name 0) in TWA titles.
+/// Internal name for GL's default texture object (name 0).
 const DEFAULT_TEXTURE_NAME: u32 = 0x7fff_0000;
 /// Guest addresses below this read as zero when `zero_null_page_reads` is set.
 const NULL_PAGE_SIZE: u32 = 0x1000;
@@ -3237,26 +3237,21 @@ impl Eapp {
             // PopCap loads several textures through this bind-before-upload
             // sequence and reuses the same material handles across them.
             4 => {
-                // Texture 0 is GL's default texture object, not "unbound".
-                // The TWA engine draws its question screens in software and
-                // uploads them into texture 0 (TexImage2D, then TexSubImage2D
-                // every frame); give it a name of its own so those uploads
-                // are kept and sampled. Other titles keep 0 as unbound.
-                let tex_name = if args[1] == 0 && self.is_twa_engine() {
-                    DEFAULT_TEXTURE_NAME
-                } else {
-                    args[1]
-                };
+                // Texture 0 is GL's default texture object, not "unbound":
+                // titles upload into it and sample it like any other name.
+                // The TWA engine draws its question screens in software into
+                // texture 0 (TexImage2D, then TexSubImage2D every frame), Zuma
+                // keeps its 322x242 screen background there and refills it for
+                // the title, menus and each level board, and Cubis 2 draws its
+                // loading bar from it. Give it a name of its own so those
+                // uploads are kept and sampled.
+                let tex_name = if args[1] == 0 { DEFAULT_TEXTURE_NAME } else { args[1] };
                 if let Some(lg) = self.live_gl.as_mut() {
                     // Keep the bind live after the upload. `pending_tex_name`
                     // is consumed by the next TexImage2D, while this state
                     // identifies the texture sampled by the next draw.
-                    lg.bound_tex_name = (tex_name != 0).then_some(tex_name);
-                }
-                if tex_name != 0 {
-                    if let Some(lg) = self.live_gl.as_mut() {
-                        lg.pending_tex_name = Some(tex_name);
-                    }
+                    lg.bound_tex_name = Some(tex_name);
+                    lg.pending_tex_name = Some(tex_name);
                 }
                 0
             }
