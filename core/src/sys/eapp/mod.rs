@@ -260,8 +260,8 @@ const DMA_FB_SIZE: usize = 320 * 240 * 2; // 153,600 bytes for 320×240 RGB565
 /// at this callsite — it is never written into a UTF-16 buffer for the scalar
 /// (register-computed) formatter path. Recording it here lets the renderer
 /// reconstruct the intended text without hardcoding strings. The constant is a
-/// per-binary address, but the convention is shared-runtime; non-Tetris titles
-/// simply never hit this PC and are unaffected.
+/// per-binary address, but the convention is shared-runtime. Other binaries
+/// have unrelated code at this address, so the hook only runs for Tetris.
 const TEXT_PUSH_CHAR_PC: u32 = 0x1801_616c;
 /// Cluster-A clock formatter entry (VMA). After `cmp r3,#0; bxeq lr` guard,
 /// so r3 (time-value ptr) is non-zero here. Used by the temporary RE hook.
@@ -1136,7 +1136,7 @@ impl Eapp {
             .and_then(|name| name.to_str())
             .map(str::to_string)
             .unwrap_or_else(|| executable_path.display().to_string());
-        let title = canonicalize_game_title(&raw_title, &bundle_dir, &executable_path);
+        let title = canonicalize_game_title(&raw_title, &bundle_dir);
         let metadata = EappMetadata {
             title,
             bundle_dir,
@@ -1201,16 +1201,12 @@ impl Eapp {
         game_heap.bulk_write(0, &vec![0u8; GAME_HEAP_SIZE]);
 
         let title_str = image.metadata.title.as_str();
-        let bundle_path_str = image.metadata.bundle_dir.to_str().unwrap_or("");
-        let is_tetris = title_str == "66666" || bundle_path_str.contains("66666");
-        let is_vortex = title_str == "12345" || bundle_path_str.contains("12345");
-        let is_pacman = title_str == "AAAAA" || bundle_path_str.contains("AAAAA");
-        let is_mspacman = title_str == "14004" || bundle_path_str.contains("14004");
-        let is_holdem = title_str == "33333" || bundle_path_str.contains("33333");
-        let is_popcap = matches!(title_str, "44444" | "55555" | "99999")
-            || bundle_path_str.contains("44444")
-            || bundle_path_str.contains("55555")
-            || bundle_path_str.contains("99999");
+        let is_tetris = title_str == "66666";
+        let is_vortex = title_str == "12345";
+        let is_pacman = title_str == "AAAAA";
+        let is_mspacman = title_str == "14004";
+        let is_holdem = title_str == "33333";
+        let is_popcap = matches!(title_str, "44444" | "55555" | "99999");
         let string_trace_enabled = string_trace_enabled();
         let save_root = image.metadata.bundle_dir.join(SAVE_DIR);
 
@@ -2303,46 +2299,7 @@ impl Eapp {
             }
         }
 
-        // Vortex (12345) compatibility shim: its early OpenGLES surface setup
-        // calls binary-local block-copy helpers at 0x18014d38/0x18011274 and
-        // later GL/state initializers at 0x1800aa40/0x18013eec. The first pair
-        // can load near-null block-copy destinations from literal-pool-backed
-        // register blocks; the second pair expects `[global+4]` to point at a
-        // mutable GL state block before writing fields like +0x24/+0x60/+0x9c.
-        // Bootstrap preallocates work-RAM scratch structures for both cases.
-        // This is intentionally gated by bundle id and exact PC/range so
-        // working titles cannot observe it.
         if self.is_vortex {
-            if pc == 0x1801_4d54u32 || pc == 0x1801_1290u32 {
-                let mode = self.cpu.mode();
-                let current_r0 = self.cpu.reg_get(mode, 0);
-                if current_r0 < WORK_RAM_BASE {
-                    let surface_buf = self.read_guest_u32(WORK_RAM_BASE + 0xff4).unwrap_or(0);
-                    if surface_buf != 0 {
-                        self.cpu.reg_set(mode, 0, surface_buf);
-                    }
-                }
-            }
-            if pc == 0x1801_8ae8u32 || pc == 0x1801_8aecu32 {
-                let mode = self.cpu.mode();
-                let current_r4 = self.cpu.reg_get(mode, 4);
-                if current_r4 == 0 {
-                    let object = self.read_guest_u32(WORK_RAM_BASE + 0xff8).unwrap_or(0);
-                    if object != 0 {
-                        self.cpu.reg_set(mode, 4, object);
-                    }
-                }
-            }
-            if pc == 0x1801_3e00u32 || pc == 0x1801_3e04u32 || pc == 0x1801_3e08u32 {
-                let mode = self.cpu.mode();
-                let current_r4 = self.cpu.reg_get(mode, 4);
-                if current_r4 == 0 {
-                    let object = self.read_guest_u32(WORK_RAM_BASE + 0xff8).unwrap_or(0);
-                    if object != 0 {
-                        self.cpu.reg_set(mode, 4, object);
-                    }
-                }
-            }
             if pc == 0x1801_0f4cu32 && self.gl_hle_enabled() {
                 // PR #3 reaches this Vortex request callback with state 10,
                 // entering the guest's own audio-manager reset at 0x180111cc.
@@ -2356,44 +2313,6 @@ impl Eapp {
                 let kind = self.read_guest_u32(req.wrapping_add(0x4c)).unwrap_or(0);
                 if state == 9 && kind == 0x0c {
                     let _ = self.write_guest_bytes(req.wrapping_add(0x44), &[0x0a]);
-                }
-            }
-            if (0x1800_ab08u32..=0x1800_ab3cu32).contains(&pc) {
-                let mode = self.cpu.mode();
-                let current_r4 = self.cpu.reg_get(mode, 4);
-                let state_block = self.read_guest_u32(WORK_RAM_BASE + 0xffc).unwrap_or(0);
-                if current_r4 != 0 && state_block != 0 {
-                    let target_slot = current_r4.wrapping_add(4);
-                    let current_ptr = self.read_guest_u32(target_slot).unwrap_or(0);
-                    if current_ptr < WORK_RAM_BASE {
-                        let _ = self.write_guest_u32(target_slot, state_block);
-                    }
-                    let current_r1 = self.cpu.reg_get(mode, 1);
-                    if current_r1 < WORK_RAM_BASE {
-                        self.cpu.reg_set(mode, 1, state_block);
-                    }
-                    if pc == 0x1800_ab38u32 || pc == 0x1800_ab3cu32 {
-                        let current_r0 = self.cpu.reg_get(mode, 0);
-                        if current_r0 < WORK_RAM_BASE {
-                            self.cpu.reg_set(mode, 0, state_block);
-                        }
-                    }
-                }
-            }
-            if (0x1801_3ef4u32..=0x1801_3f1cu32).contains(&pc) {
-                let mode = self.cpu.mode();
-                let current_r3 = self.cpu.reg_get(mode, 3);
-                let state_block = self.read_guest_u32(WORK_RAM_BASE + 0xffc).unwrap_or(0);
-                if current_r3 != 0 && state_block != 0 {
-                    let target_slot = current_r3.wrapping_add(4);
-                    let current_ptr = self.read_guest_u32(target_slot).unwrap_or(0);
-                    if current_ptr < WORK_RAM_BASE {
-                        let _ = self.write_guest_u32(target_slot, state_block);
-                    }
-                    let current_r1 = self.cpu.reg_get(mode, 1);
-                    if current_r1 < WORK_RAM_BASE {
-                        self.cpu.reg_set(mode, 1, state_block);
-                    }
                 }
             }
         }
@@ -2445,7 +2364,7 @@ impl Eapp {
         // helper callsite. The char (r1) is the authoritative per-glyph
         // selector for the register-computed formatter path (Tetris draws
         // 9-14, `HH:MM AM/PM`), where no UTF-16 buffer is ever written.
-        if pc == TEXT_PUSH_CHAR_PC {
+        if self.is_tetris && pc == TEXT_PUSH_CHAR_PC {
             let mode = self.cpu.mode();
             let text_obj = self.cpu.reg_get(mode, 0);
             let char_code = self.cpu.reg_get(mode, 1);
@@ -4374,11 +4293,6 @@ impl Eapp {
 
     fn live_is_holdem(&self) -> bool {
         self.metadata.title == "33333"
-            || self
-                .metadata
-                .bundle_dir
-                .to_str()
-                .is_some_and(|path| path.contains("33333"))
     }
 
     /// Apply the matrix helpers used by the direct PR #3 title oracles.
@@ -4874,50 +4788,6 @@ impl Eapp {
             "ordinal_166: glLoadIdentity fixed state_ptr={:#010x}",
             state_ptr
         );
-    }
-
-    /// Vortex (12345) surface container fix.
-    ///
-    /// The container at 0x18063ebc is in the file-mapped region with null object pointer.
-    /// We redirect by patching all literal pool references to point to a work-RAM substitute.
-    fn vortex_preallocate_surfaces(&mut self) {
-        // Allocate work-RAM container substitute
-        let work_container = self.alloc_zeroed(0x100); // 256 bytes for container + structures
-        let surface_size = 320u32 * 240 * 2; // RGB565 framebuffer
-        let surface_buf = self.alloc_zeroed(surface_size);
-        let object = self.alloc_zeroed(0x40); // 64-byte object
-        let array = self.alloc_zeroed(0x4); // 4-byte array
-        let state_block = self.alloc_zeroed(0x200); // mutable GL/state block used by Vortex init helpers
-
-        if work_container == 0 || surface_buf == 0 || object == 0 || array == 0 || state_block == 0
-        {
-            warn!(target: "EAPP_GL", "VORTEX: allocation failed for surface structures");
-            return;
-        }
-
-        // Wire up structure chain at work_container
-        self.write_guest_u32(object.wrapping_add(0), WORK_RAM_BASE + 0x1000); // vtable
-        self.write_guest_u32(object.wrapping_add(4), surface_buf); // buffer pointer
-        self.write_guest_u32(object.wrapping_add(8), 1); // refcount
-        self.write_guest_u32(array, object);
-
-        // Container layout
-        self.write_guest_u32(work_container.wrapping_add(0), 0x3f800000);
-        self.write_guest_u32(work_container.wrapping_add(4), object);
-        self.write_guest_u32(work_container.wrapping_add(0x54), 1);
-        self.write_guest_u32(work_container.wrapping_add(0x5c), array);
-
-        info!(
-            target: "EAPP_GL",
-            "VORTEX: work_container={:#010x} object={:#010x} buffer={:#010x} state_block={:#010x}",
-            work_container, object, surface_buf, state_block
-        );
-
-        // Store addresses for the Vortex exact-PC shim and ordinal_165 handler.
-        self.write_guest_u32(WORK_RAM_BASE + 0xff0, work_container);
-        self.write_guest_u32(WORK_RAM_BASE + 0xff4, surface_buf);
-        self.write_guest_u32(WORK_RAM_BASE + 0xff8, object);
-        self.write_guest_u32(WORK_RAM_BASE + 0xffc, state_block);
     }
 
     /// Helper to allocate a surface buffer of given size
@@ -7419,12 +7289,7 @@ impl Eapp {
                 }
                 let vortex_direct = self.metadata.title == "12345"
                     && fliwheel_var_os("VORTEX_PR3_GL165").is_some();
-                let holdem_direct = self.metadata.title == "33333"
-                    || self
-                        .metadata
-                        .bundle_dir
-                        .to_str()
-                        .map_or(false, |path| path.contains("33333"));
+                let holdem_direct = self.metadata.title == "33333";
                 let button_bits = match self.metadata.title.as_str() {
                     "55555" => {
                         // Bejeweled uses the four clickwheel quadrants as a
@@ -8820,26 +8685,15 @@ impl Eapp {
             // title-scoped; Ms. PAC-MAN's measured contract is now the normal
             // path while the other title probes remain opt-in.
             let complete = tetris_async3_complete();
-            let is_tetris = self.metadata.title == "66666"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
-            let is_texas = self.metadata.title == "33333"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
-            let is_sudoku = self.metadata.title == "50513"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-            let is_royal = self.metadata.title == "50514"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
-            let is_mspacman = self.metadata.title == "14004"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
-            let is_lost = self.metadata.title == "1B200"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
-            let is_vortex = self.metadata.title == "12345"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
-            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                    p.contains("11050") || p.contains("11051") || p.contains("11052")
-                });
-            let is_iquiz = self.metadata.title == "11002"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+            let is_tetris = self.metadata.title == "66666";
+            let is_texas = self.metadata.title == "33333";
+            let is_sudoku = self.metadata.title == "50513";
+            let is_royal = self.metadata.title == "50514";
+            let is_mspacman = self.metadata.title == "14004";
+            let is_lost = self.metadata.title == "1B200";
+            let is_vortex = self.metadata.title == "12345";
+            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052");
+            let is_iquiz = self.metadata.title == "11002";
             let owner = args[0];
             let req = self.read_guest_u32(owner.wrapping_add(0x08)).unwrap_or(0);
             let req_cb = self.read_guest_u32(req.wrapping_add(0x0c)).unwrap_or(0);
@@ -9145,28 +8999,16 @@ impl Eapp {
             // and tail-calls that callback as (owner, context). Queue the same
             // callback only for the env-gated parsed-resource RE path.
             let complete = tetris_async3_complete();
-            let is_tetris = self.metadata.title == "66666"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
-            let is_texas = self.metadata.title == "33333"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
-            let is_sudoku = self.metadata.title == "50513"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-            let is_royal = self.metadata.title == "50514"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
-            let is_mspacman = self.metadata.title == "14004"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
-            let is_lost = self.metadata.title == "1B200"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
-            let is_mahjong = self.metadata.title == "77777"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
-            let is_vortex = self.metadata.title == "12345"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
-            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                    p.contains("11050") || p.contains("11051") || p.contains("11052")
-                });
-            let is_iquiz = self.metadata.title == "11002"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+            let is_tetris = self.metadata.title == "66666";
+            let is_texas = self.metadata.title == "33333";
+            let is_sudoku = self.metadata.title == "50513";
+            let is_royal = self.metadata.title == "50514";
+            let is_mspacman = self.metadata.title == "14004";
+            let is_lost = self.metadata.title == "1B200";
+            let is_mahjong = self.metadata.title == "77777";
+            let is_vortex = self.metadata.title == "12345";
+            let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052");
+            let is_iquiz = self.metadata.title == "11002";
             let owner = args[0];
             let callback_pc = self.read_guest_u32(owner.wrapping_add(0x34)).unwrap_or(0);
             let callback_ctx = self.read_guest_u32(owner.wrapping_add(0x38)).unwrap_or(0);
@@ -9673,8 +9515,7 @@ impl Eapp {
             .or_else(|| self.try_read_c_string(args[1], 256));
         if ordinal == 3
             && path.is_none()
-            && (self.metadata.title == "11002"
-                || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002")))
+            && self.metadata.title == "11002"
         {
             let req = args[2];
             let callback_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
@@ -9738,28 +9579,16 @@ impl Eapp {
                 // callback before the render loop can advance to the next
                 // asynchronous asset.
                 let owner = args[3];
-                let is_lost = self.metadata.title == "1B200"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("1B200"));
-                let is_tetris = self.metadata.title == "66666"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
-                let is_texas = self.metadata.title == "33333"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
-                let is_sudoku = self.metadata.title == "50513"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50513"));
-                let is_royal = self.metadata.title == "50514"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("50514"));
-                let is_mspacman = self.metadata.title == "14004"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
-                let is_mahjong = self.metadata.title == "77777"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("77777"));
-                let is_vortex = self.metadata.title == "12345"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("12345"));
-                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                        p.contains("11050") || p.contains("11051") || p.contains("11052")
-                    });
-                let is_iquiz = self.metadata.title == "11002"
-                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+                let is_lost = self.metadata.title == "1B200";
+                let is_tetris = self.metadata.title == "66666";
+                let is_texas = self.metadata.title == "33333";
+                let is_sudoku = self.metadata.title == "50513";
+                let is_royal = self.metadata.title == "50514";
+                let is_mspacman = self.metadata.title == "14004";
+                let is_mahjong = self.metadata.title == "77777";
+                let is_vortex = self.metadata.title == "12345";
+                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052");
+                let is_iquiz = self.metadata.title == "11002";
                 let tetris_complete = is_tetris
                     && tetris_async3_complete();
                 let texas_complete = is_texas
@@ -10289,24 +10118,13 @@ impl Eapp {
                                 // reach the board, so it is the default now
                                 // (see `tetris_async3_complete`); set
                                 // FLIWHEEL_EAPP_ASYNC3_COMPLETE=0 to disable.
-                                let is_tetris = self.metadata.title == "66666"
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
-                                let is_texas = self.metadata.title == "33333"
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("33333"));
-                                let is_popcap = matches!(self.metadata.title.as_str(), "44444" | "55555" | "99999")
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                                        p.contains("44444") || p.contains("55555") || p.contains("99999")
-                                    });
-                                let is_mspacman = self.metadata.title == "14004"
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("14004"));
-                                let is_pacman = self.metadata.title == "AAAAA"
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("AAAAA"));
-                                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052")
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| {
-                                        p.contains("11050") || p.contains("11051") || p.contains("11052")
-                                    });
-                                let is_iquiz = self.metadata.title == "11002"
-                                    || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+                                let is_tetris = self.metadata.title == "66666";
+                                let is_texas = self.metadata.title == "33333";
+                                let is_popcap = matches!(self.metadata.title.as_str(), "44444" | "55555" | "99999");
+                                let is_mspacman = self.metadata.title == "14004";
+                                let is_pacman = self.metadata.title == "AAAAA";
+                                let is_sat = matches!(self.metadata.title.as_str(), "11050" | "11051" | "11052");
+                                let is_iquiz = self.metadata.title == "11002";
                                 let tetris_complete = is_tetris
                                     && tetris_async3_complete();
                                 let texas_complete = is_texas
@@ -10483,8 +10301,7 @@ impl Eapp {
                     let cb_pc = self.read_guest_u32(req.wrapping_add(0x34)).unwrap_or(0);
                     let cb_ctx = self.read_guest_u32(req.wrapping_add(0x38)).unwrap_or(0);
 
-                    let is_iquiz_packs = (self.metadata.title == "11002"
-                        || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002")))
+                    let is_iquiz_packs = (self.metadata.title == "11002")
                         && path.to_ascii_lowercase().contains("usertrivia/packs");
 
                     let mut entries = Vec::new();
@@ -11192,23 +11009,8 @@ impl Eapp {
     }
 
     fn finish_bootstrap_entry(&mut self) {
-        // Vortex-specific surface preallocation to prevent null pointer crashes.
-        // Must run before first guest frame to set up container structures.
-        if self
-            .metadata
-            .bundle_dir
-            .to_str()
-            .map_or(false, |p| p.contains("12345"))
-        {
-            if fliwheel_var_os("VORTEX_PR3_GL165").is_some() {
-                info!(target: "EAPP", "VORTEX: using PR #3 ordinal-165 contract");
-            } else {
-                info!(target: "EAPP", "VORTEX: detected bundle, running preallocation");
-                self.vortex_preallocate_surfaces();
-                // Verify the write.
-                let verify = self.read_guest_u32(WORK_RAM_BASE + 0xff0).unwrap_or(0xdead);
-                info!(target: "EAPP", "VORTEX: verification read of WORK_RAM+0xff0 = {:#010x}", verify);
-            }
+        if self.is_vortex && fliwheel_var_os("VORTEX_PR3_GL165").is_some() {
+            info!(target: "EAPP", "VORTEX: using PR #3 ordinal-165 contract");
         }
         self.bootstrap_phase = BootstrapPhase::Running;
         self.queue_next_frame();
@@ -13128,8 +12930,7 @@ impl Eapp {
                 return Some(saved);
             }
         }
-        let is_iquiz = self.metadata.title == "11002"
-            || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
+        let is_iquiz = self.metadata.title == "11002";
         if is_iquiz {
             let norm_lower = normalized.to_ascii_lowercase();
             if let Some(_sub) = norm_lower.strip_prefix("usertrivia/packs/") {
@@ -14131,18 +13932,37 @@ fn make_controls(input_state: Arc<Mutex<EappInputState>>) -> EappBinds {
     controls
 }
 
-fn canonicalize_game_title(raw_title: &str, bundle_dir: &Path, exe_path: &Path) -> String {
-    let lower_title = raw_title.to_ascii_lowercase();
-    let lower_dir = bundle_dir.to_string_lossy().to_ascii_lowercase();
-    let lower_exe = exe_path.to_string_lossy().to_ascii_lowercase();
+/// The `GUID` value in the bundle's `Manifest.plist`, upper-cased (LOST
+/// ships `1b200`). It stays the same however the game's folder is named,
+/// which is what title-specific behavior must key on.
+fn manifest_guid(bundle_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(bundle_dir.join("Manifest.plist")).ok()?;
+    let after_key = &text[text.find("<key>GUID</key>")? + "<key>GUID</key>".len()..];
+    let value = after_key.trim_start().strip_prefix("<string>")?;
+    let guid = value[..value.find("</string>")?].trim();
+    (!guid.is_empty()).then(|| guid.to_ascii_uppercase())
+}
 
-    let matches_game = |keywords: &[&str]| {
-        keywords.iter().any(|k| {
-            lower_title.contains(k) || lower_dir.contains(k) || lower_exe.contains(k)
-        })
-    };
+/// The title id every per-title check compares against: the manifest GUID.
+/// Bundles without a manifest fall back to keywords in the folder's own
+/// name. Never the full path or the executable name: a parent folder such as
+/// "Carpool" must not turn a game into The Sims Pool.
+fn canonicalize_game_title(bundle_name: &str, bundle_dir: &Path) -> String {
+    if let Some(guid) = manifest_guid(bundle_dir) {
+        return guid;
+    }
+    let lower_name = bundle_name.to_ascii_lowercase();
+    let matches_game = |keywords: &[&str]| keywords.iter().any(|k| lower_name.contains(k));
 
-    if matches_game(&["mspacman", "ms. pac-man", "ms_pacman", "ms pac-man", "ms pacman", "14004"]) {
+    if matches_game(&[
+        "mspacman",
+        "ms. pac-man",
+        "ms.-pac-man",
+        "ms_pacman",
+        "ms pac-man",
+        "ms pacman",
+        "14004",
+    ]) {
         return "14004".to_string();
     }
     if matches_game(&["pacman", "pac-man", "aaaaa"]) {
@@ -14203,7 +14023,7 @@ fn canonicalize_game_title(raw_title: &str, bundle_dir: &Path, exe_path: &Path) 
         return "1C300".to_string();
     }
 
-    raw_title.to_string()
+    bundle_name.to_string()
 }
 
 fn find_game_executable(bundle_dir: &Path) -> Result<PathBuf, EappBuildError> {
@@ -14340,6 +14160,44 @@ mod tests {
         EappInputState, GL_IDENTITY_MATRIX, GL_PALETTE8_R5_G6_B5_OES, GL_PALETTE8_RGBA8_OES,
         GL_TEXTURE_2D, GL_TEXTURE_RECTANGLE, TextureFormat,
     };
+
+    fn scratch_bundle(name: &str, manifest: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("fliwheel-title-test-{}", std::process::id()))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = manifest {
+            std::fs::write(dir.join("Manifest.plist"), text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn title_comes_from_manifest_guid_whatever_the_folder_is_called() {
+        // LOST ships a lower-case GUID and lives in a folder named "Lost" on
+        // the Y2; a CRLF manifest must parse the same way.
+        let manifest = "<dict>\r\n\t<key>GUID</key>\r\n\t<string>1b200</string>\r\n\t<key>Name</key>\r\n\t<string>LOST</string>\r\n</dict>";
+        let dir = scratch_bundle("Lost", Some(manifest));
+        assert_eq!(super::canonicalize_game_title("Lost", &dir), "1B200");
+
+        // A manifest GUID wins over a folder name that looks like another game.
+        let manifest = "<key>GUID</key><string>66666</string>";
+        let dir = scratch_bundle("Sims Pool backup", Some(manifest));
+        assert_eq!(super::canonicalize_game_title("Sims Pool backup", &dir), "66666");
+    }
+
+    #[test]
+    fn title_fallback_reads_only_the_bundle_folder_name() {
+        // Without a manifest, keywords in a parent folder ("Carpool") must not
+        // select a title; only the bundle's own name counts.
+        let dir = scratch_bundle("Carpool/Tetris", None);
+        assert_eq!(super::canonicalize_game_title("Tetris", &dir), "66666");
+        let dir = scratch_bundle("Carpool/Unknown Game", None);
+        assert_eq!(super::canonicalize_game_title("Unknown Game", &dir), "Unknown Game");
+        let dir = scratch_bundle("Ms.-Pac-Man", None);
+        assert_eq!(super::canonicalize_game_title("Ms.-Pac-Man", &dir), "14004");
+    }
 
     #[test]
     fn title_async_gate_uses_fallback_when_override_is_absent() {
