@@ -73,6 +73,9 @@ const GAME_HEAP_BASE: u32 = 0x1900_0000;
 const GAME_HEAP_SIZE: usize = 64 * 1024 * 1024;
 const LEGACY_ENV_PREFIX: &str = "CLICKY_";
 const SAVE_DIR: &str = ".fliwheel-saves";
+/// `audio_fields` key holding the PCM pointer from `Audio:7`. Outside the
+/// descriptor's real 0x00..0x40 field range.
+const RAW_PCM_PTR_FIELD: u32 = 0x1000;
 const LEGACY_SAVE_DIR: &str = ".clicky-saves";
 
 /// Read a fliwheel runtime option by its suffix. New callers use the
@@ -8216,7 +8219,17 @@ impl Eapp {
                 } else {
                     args[1]
                 };
-                self.audio_fields.insert((args[0], offset), value);
+                let previous = self.audio_fields.insert((args[0], offset), value);
+                if matches!(ordinal, 8 | 10 | 11 | 12)
+                    && previous != Some(value)
+                    && self.uses_raw_pcm_audio_source_abi()
+                    && self.audio_fields.contains_key(&(args[0], RAW_PCM_PTR_FIELD))
+                {
+                    if let Some(source) = self.audio_handles.get_mut(&args[0]) {
+                        source.host_path = None;
+                    }
+                    self.bind_raw_pcm_audio_source(args[0]);
+                }
                 0
             }
             0 => {
@@ -8309,6 +8322,19 @@ impl Eapp {
                 }
                 handle
             }
+            7 if self.uses_raw_pcm_audio_source_abi() => {
+                // The game decoded its WAVs itself and hands the source a raw
+                // PCM pointer. Audio:8/10/11/12 give its byte length, rate,
+                // channels and bits; iQuiz sets them before this call, the
+                // Sims and SAT Prep titles after it, so bind as soon as all
+                // are known (here, on a later setter, or at Audio:2).
+                self.audio_fields.insert((args[0], RAW_PCM_PTR_FIELD), args[1]);
+                if let Some(source) = self.audio_handles.get_mut(&args[0]) {
+                    source.host_path = None;
+                }
+                self.bind_raw_pcm_audio_source(args[0]);
+                0
+            }
             7 if self.metadata.title == "12345" && self.gl_hle_enabled() => {
                 // Vortex stores all 47 effects in one raw bank. The guest's
                 // Audio:7 calls arrive in bank order, so bind each call to
@@ -8348,7 +8374,15 @@ impl Eapp {
                     || self.uses_wav_audio_source_abi()
                     || self.uses_pacman_wav_audio_source_abi()
                     || self.uses_mspacman_wav_audio_source_abi()
+                    || self.uses_raw_pcm_audio_source_abi()
                 {
+                    let unbound = self
+                        .audio_handles
+                        .get(&args[0])
+                        .is_some_and(|source| source.host_path.is_none());
+                    if unbound && self.uses_raw_pcm_audio_source_abi() {
+                        self.bind_raw_pcm_audio_source(args[0]);
+                    }
                     if let Some(source) = self.audio_handles.get(&args[0]).cloned() {
                         if let Some(host_path) = source.host_path {
                             let resource_index = if self.uses_mspacman_wav_audio_source_abi()
@@ -11747,6 +11781,95 @@ impl Eapp {
         self.metadata.title == "33333"
     }
 
+    /// `Audio:7(handle, pcm)` is the firmware's shared way to hand a source
+    /// decoded PCM (iQuiz, The Sims Bowling/Pool, SAT Prep, ...). Use it for
+    /// every title except those that bind their sources from a sound bank
+    /// file instead (Vortex, Hold'em) or never call `Audio:7`.
+    fn uses_raw_pcm_audio_source_abi(&self) -> bool {
+        !(self.metadata.title == "12345"
+            || self.uses_holdem_blob_audio_source_abi()
+            || self.uses_wav_audio_source_abi()
+            || self.uses_pacman_wav_audio_source_abi()
+            || self.uses_mspacman_wav_audio_source_abi())
+    }
+
+    /// Copy the PCM a source points at into a WAV under the save directory
+    /// and attach it to that source. Pointer from `Audio:7`, format from the
+    /// setters: #8 byte length, #10 rate, #11 channels, #12 bits per sample.
+    fn bind_raw_pcm_audio_source(&mut self, handle: u32) {
+        const MAX_PCM_BYTES: u32 = 8 * 1024 * 1024;
+        let field = |this: &Self, offset: u32| this.audio_fields.get(&(handle, offset)).copied();
+        let (Some(pcm_ptr), Some(len), Some(rate), Some(channels), Some(bits)) = (
+            field(self, RAW_PCM_PTR_FIELD),
+            field(self, 0x08),
+            field(self, 0x10),
+            field(self, 0x14),
+            field(self, 0x18),
+        ) else {
+            // Not every setter has run yet; a later one or Audio:2 retries.
+            return;
+        };
+        if pcm_ptr == 0
+            || len == 0
+            || len > MAX_PCM_BYTES
+            || !(1..=2).contains(&channels)
+            || !matches!(bits, 8 | 16)
+            || !(4_000..=48_000).contains(&rate)
+            || !self.audio_handles.contains_key(&handle)
+        {
+            warn!(
+                target: "EAPP_AUDIO",
+                "raw PCM source {:#x} rejected ptr={:#010x} len={} rate={} ch={} bits={}",
+                handle, pcm_ptr, len, rate, channels, bits
+            );
+            return;
+        }
+        let Some(pcm) = self.read_guest_bytes(pcm_ptr, len as usize) else {
+            warn!(target: "EAPP_AUDIO", "raw PCM source {:#x} buffer {:#010x}+{} is unreadable", handle, pcm_ptr, len);
+            return;
+        };
+        if pcm.iter().all(|byte| *byte == 0) {
+            // Tetris hands over the buffer before loading samples into it.
+            // Stay unbound so Audio:2 snapshots the filled buffer.
+            return;
+        }
+        let wav = build_pcm_wav(&pcm, rate, channels as u16, bits as u16);
+        // Name by content so a relaunch reuses the file and a source that
+        // is rebound with other samples never plays stale audio.
+        let hash = wav.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        let dir = self.metadata.bundle_dir.join(SAVE_DIR).join("pcm-sfx");
+        let dir = if fs::create_dir_all(&dir).is_ok() {
+            dir
+        } else {
+            let fallback = std::env::temp_dir().join("fliwheel-pcm-sfx");
+            if fs::create_dir_all(&fallback).is_err() {
+                warn!(target: "EAPP_AUDIO", "raw PCM output directory is unavailable: {}", fallback.display());
+                return;
+            }
+            fallback
+        };
+        let path = dir.join(format!("sfx-{hash:016x}.wav"));
+        let cached = fs::metadata(&path)
+            .ok()
+            .is_some_and(|metadata| metadata.len() == wav.len() as u64);
+        if !cached && fs::write(&path, &wav).is_err() {
+            warn!(target: "EAPP_AUDIO", "raw PCM source {:#x} could not be written to {}", handle, path.display());
+            return;
+        }
+        if std::env::var_os("EAPP_AUDIO_EVENT_TRACE").is_some() {
+            info!(
+                target: "EAPP_AUDIO",
+                "AudioSourceMap raw PCM handle={:#010x} len={} rate={} ch={} bits={} path={}",
+                handle, len, rate, channels, bits, path.display()
+            );
+        }
+        if let Some(source) = self.audio_handles.get_mut(&handle) {
+            source.host_path = Some(path);
+        }
+    }
+
     fn note_wav_audio_asset_path(&mut self, host_path: &Path) {
         let is_wav = host_path
             .extension()
@@ -13815,6 +13938,27 @@ impl Memory for EappBus {
 /// Return the byte ranges of the 47 validated WAV chunks embedded in Vortex's
 /// raw `media/sfx` bank. The bytes before the first RIFF are a table/header;
 /// each RIFF size includes the WAVE payload after its eight-byte prefix.
+/// Wrap little-endian PCM samples in a canonical 44-byte RIFF/WAVE header.
+fn build_pcm_wav(pcm: &[u8], rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+    let block_align = channels * (bits / 8);
+    let data_len = pcm.len() as u32;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
 fn parse_vortex_sfx_bank(data: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut ranges = Vec::with_capacity(47);
     let mut scan = 0usize;
@@ -14192,7 +14336,7 @@ mod tests {
     use super::{
         decode_paletted, is_paletted_compressed_upload_call, live_gl_default_present_vflip,
         env_bool_or_default, matrix_helper_transform, orthographic_matrix,
-        ordinal45_resource_format, parse_holdem_sfx_bank, parse_vortex_sfx_bank, Eapp,
+        ordinal45_resource_format, parse_holdem_sfx_bank, build_pcm_wav, parse_vortex_sfx_bank, Eapp,
         EappInputState, GL_IDENTITY_MATRIX, GL_PALETTE8_R5_G6_B5_OES, GL_PALETTE8_RGBA8_OES,
         GL_TEXTURE_2D, GL_TEXTURE_RECTANGLE, TextureFormat,
     };
@@ -14242,6 +14386,20 @@ mod tests {
         assert_eq!(&bank[ranges[0].0..ranges[0].0 + 4], b"RIFF");
         assert_eq!(ranges[0].0, 12);
         assert!(parse_vortex_sfx_bank(&bank[..ranges[45].1]).is_none());
+    }
+
+    #[test]
+    fn raw_pcm_wav_round_trips_through_bank_parser() {
+        use std::convert::TryInto;
+        let pcm = [1u8, 0, 0xff, 0xff, 2, 0];
+        let wav = build_pcm_wav(&pcm, 22_050, 1, 16);
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 22_050);
+        assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 44_100);
+        assert_eq!(u16::from_le_bytes(wav[32..34].try_into().unwrap()), 2);
+        assert_eq!(&wav[44..], &pcm);
+        assert_eq!(super::parse_vortex_wav_end(&wav, 0), Some(wav.len()));
     }
 
     #[test]
