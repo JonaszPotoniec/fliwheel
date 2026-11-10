@@ -1082,6 +1082,11 @@ impl LiveGlState {
         tex_name: u32,
         uvs: &[(f32, f32)],
     ) -> Option<usize> {
+        // The newest upload says nothing about the texture when the name is
+        // shared by every image (see `shares_one_texture_name`).
+        if self.shares_one_texture_name(tex_name) {
+            return None;
+        }
         let (_min_u, _min_v, max_u, max_v) = uv_extents_slice(uvs);
         let need_w = needed_texture_extent_from_centered_uv(max_u);
         let need_h = needed_texture_extent_from_centered_uv(max_v);
@@ -1145,7 +1150,7 @@ impl LiveGlState {
             return Some(idx);
         }
 
-        self.select_latest_containing_upload_with_tex_name(tex_name, max_u, max_v)
+        self.select_latest_containing_upload_with_tex_name(tex_name, span_w, max_u, max_v)
     }
 
     /// Generated text UVs describe one glyph cell inside a font atlas. Prefer
@@ -1175,7 +1180,7 @@ impl LiveGlState {
                         && u.format == Some(TextureFormat::A8)
                         && u.width >= need_w
                         && u.height >= need_h
-                        && u.width % cell_w == 0
+                        && matches!(u.width % cell_w, 0 | FONT_STRIP_PADDING)
                         && u.height % cell_h == 0
                         && (u.width / cell_w) >= 32
                 })
@@ -1223,24 +1228,61 @@ impl LiveGlState {
     /// earlier contents. Keep the history for diagnostics, but resolve a
     /// same-name UV fallback in upload order so a stale smaller texture cannot
     /// win merely because it contains the requested sub-rectangle.
+    ///
+    /// Tetris uploads every texture under one name (0x8), its font strips
+    /// last, so a quad wider than any glyph would land on the newest font
+    /// strip that happens to be large enough (the menu header drew a slice
+    /// of the katakana sheet). Such a quad skips font strips while another
+    /// upload under the name contains it.
     fn select_latest_containing_upload_with_tex_name(
         &self,
         tex_name: u32,
+        span_w: usize,
         max_u: f32,
         max_v: f32,
     ) -> Option<usize> {
         let need_w = needed_texture_extent_from_centered_uv(max_u);
         let need_h = needed_texture_extent_from_centered_uv(max_v);
-        self.uploads
-            .iter()
-            .rev()
-            .find(|u| {
-                u.texture.is_some()
-                    && u.tex_name == Some(tex_name)
-                    && texture_extent_contains_uv(u.width, need_w, max_u)
-                    && texture_extent_contains_uv(u.height, need_h, max_v)
-            })
-            .map(|u| u.index)
+        let contains = |u: &&LiveGlUpload| {
+            u.texture.is_some()
+                && u.tex_name == Some(tex_name)
+                && texture_extent_contains_uv(u.width, need_w, max_u)
+                && texture_extent_contains_uv(u.height, need_h, max_v)
+        };
+        let wider_than_glyph = span_w > MAX_GLYPH_CELL;
+        if self.shares_one_texture_name(tex_name) {
+            // Every image is a candidate, so take the tightest one: the
+            // 91x20 label backgrounds are labelBG (92x44), not the wheel art
+            // or a font strip uploaded later.
+            let tightest = |skip_fonts: bool| {
+                self.uploads
+                    .iter()
+                    .filter(contains)
+                    .filter(|u| !(skip_fonts && is_font_strip(u)))
+                    .min_by_key(|u| (u.width * u.height, u.index))
+                    .map(|u| u.index)
+            };
+            return (if wider_than_glyph { tightest(true) } else { None }).or_else(|| tightest(false));
+        }
+        if wider_than_glyph {
+            if let Some(u) = self
+                .uploads
+                .iter()
+                .rev()
+                .filter(contains)
+                .find(|u| !is_font_strip(u))
+            {
+                return Some(u.index);
+            }
+        }
+        self.uploads.iter().rev().find(contains).map(|u| u.index)
+    }
+
+    /// Tetris uploads all its A8 art and fonts (menus, labels, frames,
+    /// spinners, every font strip) under GL name 0x8 and keeps drawing all
+    /// of them, so for that name upload order does not tell them apart.
+    fn shares_one_texture_name(&self, tex_name: u32) -> bool {
+        self.game_id == "66666" && tex_name == 0x8
     }
 
     /// PopCap's board/background material submits a 320x240 UV span, but
@@ -1768,6 +1810,20 @@ fn first_four_vertex_colors(colors: &[[f32; 4]]) -> Option<[[f32; 4]; 4]> {
 /// Infer intended texture dimensions from texel-centered UVs. The captured
 /// UVs are half-texel centered (e.g. 0.5 .. 50.5 for a 50px texture), so the
 /// span rounds to the texture dimension.
+/// Widest glyph cell of the A8 font strips (Tetris' f23x22 game font).
+const MAX_GLYPH_CELL: usize = 32;
+
+/// Strips of odd-width glyphs are padded to an even width: Tetris'
+/// f13x13menu is 1276 px for 98 cells of 13 (f17x16, f23x22 likewise).
+/// Only exactly this much: Tetris' 11 px tiles leave 1 px of f23x22's 2256
+/// and must not take it for a font.
+const FONT_STRIP_PADDING: usize = 2;
+
+/// A one- or two-row A8 glyph strip, such as Tetris' f8x10text1 (784x20).
+fn is_font_strip(upload: &LiveGlUpload) -> bool {
+    upload.format == Some(TextureFormat::A8) && upload.height <= 64 && upload.width >= 16 * upload.height
+}
+
 fn uv_extents(uvs: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
     uv_extents_slice(uvs)
 }

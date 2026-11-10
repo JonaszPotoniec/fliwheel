@@ -95,10 +95,33 @@ fn fliwheel_var(suffix: &str) -> Result<String, std::env::VarError> {
     }
 }
 
+/// Tetris' parsed-resource loader waits on async completions that only the
+/// firmware delivers. Every verified Tetris run completes them, and without it
+/// the credits, name entry and menu text never load, so this is on unless
+/// `FLIWHEEL_EAPP_ASYNC3_COMPLETE=0`. All callers scope it to Tetris.
+fn tetris_async3_complete() -> bool {
+    fliwheel_var("EAPP_ASYNC3_COMPLETE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
+}
+
 fn env_bool_or_default(name: &str, default: bool) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
+}
+
+/// The float matrix product leaves noise such as 23.999996 for 24, which
+/// moves a glyph edge across a pixel and cuts a column off the glyph (the
+/// Tetris credits lost the left of every T). Values that close to a whole
+/// pixel are taken as that pixel.
+fn snap_to_pixel_edge(value: f32) -> f32 {
+    let nearest = value.round();
+    if (value - nearest).abs() < 1.0e-3 {
+        nearest
+    } else {
+        value
+    }
 }
 
 /// Multiply two column-major 4x4 matrices using the render-server layout.
@@ -882,6 +905,9 @@ pub struct Eapp {
     staged_file_generation: u64,
     halted: bool,
     stop_signal: Arc<AtomicBool>,
+    /// Set once the game has ended itself (lifecycle state 6, see
+    /// `game_has_ended`). The host closes the session on it.
+    finished: Arc<AtomicBool>,
     frame_seq: Arc<AtomicU64>,
     /// Optional live OpenGLES HLE state. Present only when
     /// `FLIWHEEL_EXPERIMENTAL_GL_HLE=1`; when `None` the legacy fill-color
@@ -1288,6 +1314,7 @@ impl Eapp {
             staged_file_generation: 0,
             halted: false,
             stop_signal: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
             frame_seq: Arc::new(AtomicU64::new(0)),
             live_gl: Self::maybe_init_live_gl(game_id),
             usse_program: None,
@@ -1447,6 +1474,29 @@ impl Eapp {
 
     pub fn frame_seq(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.frame_seq)
+    }
+
+    /// True once the game has quit by itself (its own Quit, after saving).
+    /// The emulator then stops; on an iPod the firmware returns to its menu.
+    pub fn finished_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.finished)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    /// The frame vector's context byte is the game's lifecycle state, which
+    /// it copies to `app_object[0]` before returning: 0 init, 1 frame,
+    /// 5 suspend or quit, 6 ending. Tetris's Quit saves, then stays in 6 and
+    /// returns at once from every later frame, so a host that keeps calling
+    /// it shows the last frame ("SAVING") forever. LOST and the Sims engine
+    /// get their reason byte from the host instead, so they are left out.
+    fn game_has_ended(&mut self) -> bool {
+        if self.metadata.title == "1B200" || self.is_sims_engine() || self.frame_context == 0 {
+            return false;
+        }
+        self.read_guest_u8(self.frame_context) == Some(6)
     }
 
     pub fn halt(&self) {
@@ -2210,9 +2260,7 @@ impl Eapp {
         // cascade and byte-count forwarding once control returns.
         if pc == 0x1801_fd50u32
             && self.is_tetris
-            && fliwheel_var("EAPP_ASYNC3_COMPLETE")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
+            && tetris_async3_complete()
         {
             let mode = self.cpu.mode();
             let req = self.cpu.reg_get(mode, 4);
@@ -2979,9 +3027,7 @@ impl Eapp {
                 // Vortex and Hold'em use #169 as the fixed-function mat4
                 // translate helper. Other live-HLE title families use the
                 // same ordinal as their screen-space translation ABI.
-                let matrix_title = (self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-                    || self.live_is_holdem();
+                let matrix_title = self.live_uses_matrix_abi();
                 if !matrix_title {
                     self.live_handle_translate(args);
                 }
@@ -2991,9 +3037,7 @@ impl Eapp {
                 0
             }
             171 | 173 | 175 => {
-                if (self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-                    || self.live_is_holdem()
+                if self.live_uses_matrix_abi()
                 {
                     self.live_handle_matrix_op(ordinal, args);
                 } else if ordinal != 175 {
@@ -3147,9 +3191,7 @@ impl Eapp {
             }
             // Ordinal 167: shader program use/bind. Lost doesn't call this but TWA does.
             167 => {
-                if (self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-                    || self.live_is_holdem()
+                if self.live_uses_matrix_abi()
                 {
                     self.live_handle_vortex_ortho(args);
                 } else {
@@ -3224,9 +3266,7 @@ impl Eapp {
             }
             // OpenGLES:149 is glUniformMatrix4xvAPPLE (fixed-point matrix uniform).
             149 => {
-                if (self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-                    || self.live_is_holdem()
+                if self.live_uses_matrix_abi()
                 {
                     self.live_handle_mvp_fixed(args);
                 }
@@ -3238,9 +3278,7 @@ impl Eapp {
             // the other families continue using their established screen
             // coordinate paths.
             125 => {
-                if (self.metadata.title == "12345"
-                    && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-                    || self.live_is_holdem()
+                if self.live_uses_matrix_abi()
                 {
                     self.live_handle_mvp(args);
                 }
@@ -4286,6 +4324,19 @@ impl Eapp {
         }
     }
 
+    /// Titles whose OpenGLES matrix helpers (165 identity, 169 translate,
+    /// 171 scale, 173 rotate, 175 multiply, 125 upload) work on a guest
+    /// matrix in memory, which the draw then reads as its MVP.
+    fn live_uses_matrix_abi(&self) -> bool {
+        (self.metadata.title == "12345" && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
+            || self.live_is_holdem()
+            // Tetris keeps its modelview at 0x180254c8 and saves/restores
+            // it in memory around each menu item, so a running sum of the
+            // translates loses every parent offset (menu labels collapsed to
+            // the screen edge).
+            || self.is_tetris
+    }
+
     fn live_is_holdem(&self) -> bool {
         self.metadata.title == "33333"
             || self
@@ -4305,9 +4356,7 @@ impl Eapp {
     /// feature flag because its card scene uses the fixed-function matrix
     /// helpers directly.
     fn live_handle_matrix_op(&mut self, ordinal: u32, args: [u32; 4]) {
-        let vortex_matrix =
-            self.metadata.title == "12345" && fliwheel_var_os("VORTEX_PR3_GL165").is_some();
-        if !vortex_matrix && !self.live_is_holdem() {
+        if !self.live_uses_matrix_abi() {
             return;
         }
         let dst = args[0];
@@ -4627,8 +4676,7 @@ impl Eapp {
         // The direct PR #3 runner binds ordinal 165 to the ordinary
         // glLoadIdentity contract. Keep the older Vortex surface wiring
         // available for comparison, but allow an exact oracle-style A/B.
-        if (self.metadata.title == "12345" && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-            || self.live_is_holdem()
+        if self.live_uses_matrix_abi()
         {
             if state_ptr != 0 {
                 for i in 0..16u32 {
@@ -5039,9 +5087,7 @@ impl Eapp {
             return;
         }
         let state_words = self.read_guest_words(state_ptr, 16);
-        let mvp = ((self.metadata.title == "12345"
-            && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-            || self.live_is_holdem())
+        let mvp = self.live_uses_matrix_abi()
             .then(|| self.live_gl.as_ref().and_then(|lg| lg.mvp))
             .flatten();
         let decoded_positions = match mvp {
@@ -5455,6 +5501,15 @@ impl Eapp {
         }
         let pointer_handle =
             (WORK_RAM_BASE..WORK_RAM_BASE + WORK_RAM_SIZE as u32).contains(&handle);
+        // Tetris sets the colour uniform (148) only while its image material
+        // 0x8 is bound; the menu fonts are pointer materials that never get
+        // one, and their vertex colours are white. Tinting them with the last
+        // image colour drew the selected label yellow on its yellow bar.
+        let modulate = if self.is_tetris && pointer_handle {
+            Rgba8::rgba(255, 255, 255, 255)
+        } else {
+            modulate
+        };
         // Decode the generated UVs before positions are translated.  Tetris
         // and sibling runtimes keep one base cursor translation on the first
         // glyph, then emit only the per-glyph delta (usually 8 or 16 pixels)
@@ -5504,9 +5559,7 @@ impl Eapp {
             self.live_maybe_dump_texgen_stack_locals();
         }
 
-        let uploaded_mvp = ((self.metadata.title == "12345"
-            && fliwheel_var_os("VORTEX_PR3_GL165").is_some())
-            || self.live_is_holdem())
+        let uploaded_mvp = self.live_uses_matrix_abi()
             .then(|| self.live_gl.as_ref().and_then(|lg| lg.mvp))
             .flatten();
         let decoded_positions = match uploaded_mvp {
@@ -5866,7 +5919,8 @@ impl Eapp {
             let y = read(1) + translation.1;
             let z = (components >= 3).then(|| read(2)).unwrap_or(0.0);
             let w = (components >= 4).then(|| read(3)).unwrap_or(1.0);
-            points.push(project_mvp_position(mvp, x, y, z, w));
+            let (px, py) = project_mvp_position(mvp, x, y, z, w);
+            points.push((snap_to_pixel_edge(px), snap_to_pixel_edge(py)));
         }
         Some(points)
     }
@@ -8674,9 +8728,7 @@ impl Eapp {
             // Tetris-specific 0x1801fbfc helper. Keep the completion
             // title-scoped; Ms. PAC-MAN's measured contract is now the normal
             // path while the other title probes remain opt-in.
-            let complete = fliwheel_var("EAPP_ASYNC3_COMPLETE")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false);
+            let complete = tetris_async3_complete();
             let is_tetris = self.metadata.title == "66666"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
             let is_texas = self.metadata.title == "33333"
@@ -9001,9 +9053,7 @@ impl Eapp {
             // Firmware completion helper 0x18020070 clears the in-flight byte
             // and tail-calls that callback as (owner, context). Queue the same
             // callback only for the env-gated parsed-resource RE path.
-            let complete = fliwheel_var("EAPP_ASYNC3_COMPLETE")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false);
+            let complete = tetris_async3_complete();
             let is_tetris = self.metadata.title == "66666"
                 || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
             let is_texas = self.metadata.title == "33333"
@@ -9620,9 +9670,7 @@ impl Eapp {
                 let is_iquiz = self.metadata.title == "11002"
                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
                 let tetris_complete = is_tetris
-                    && fliwheel_var("EAPP_ASYNC3_COMPLETE")
-                        .map(|v| v == "1" || v == "true")
-                        .unwrap_or(false);
+                    && tetris_async3_complete();
                 let texas_complete = is_texas
                     && env_bool_or_default("EAPP_TEXAS_ASYNC0_COMPLETE", true);
                 let sudoku_complete = is_sudoku
@@ -10146,10 +10194,10 @@ impl Eapp {
                                 // materialized) but stalled the loader on the
                                 // legal/loading screen (iteration 10
                                 // regression, reverted in iteration 11). The
-                                // full owner-callback ABI is still being
-                                // reversed; default stays at 0 (golden). Set
-                                // FLIWHEEL_EAPP_ASYNC3_COMPLETE=1 to re-enable
-                                // the iteration-10 behavior for RE.
+                                // later probes run with this completion on and
+                                // reach the board, so it is the default now
+                                // (see `tetris_async3_complete`); set
+                                // FLIWHEEL_EAPP_ASYNC3_COMPLETE=0 to disable.
                                 let is_tetris = self.metadata.title == "66666"
                                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("66666"));
                                 let is_texas = self.metadata.title == "33333"
@@ -10169,9 +10217,7 @@ impl Eapp {
                                 let is_iquiz = self.metadata.title == "11002"
                                     || self.metadata.bundle_dir.to_str().map_or(false, |p| p.contains("11002"));
                                 let tetris_complete = is_tetris
-                                    && fliwheel_var("EAPP_ASYNC3_COMPLETE")
-                                        .map(|v| v == "1" || v == "true")
-                                        .unwrap_or(false);
+                                    && tetris_async3_complete();
                                 let texas_complete = is_texas
                                     && std::env::var("EAPP_TEXAS_ASYNC3_COMPLETE")
                                         .map(|v| v == "1" || v == "true")
@@ -11015,6 +11061,16 @@ impl Eapp {
             }
             BootstrapPhase::Running => {
                 self.frame_counter = self.frame_counter.wrapping_add(1);
+                if self.game_has_ended() {
+                    info!(target: "EAPP", "frame {}: the game has ended (lifecycle state 6)", self.frame_counter);
+                    if let Err(error) = self.save_store.flush_all() {
+                        warn!(target: "EAPP", "saves could not be written at the end: {}", error);
+                    }
+                    self.finished.store(true, Ordering::Relaxed);
+                    self.halted = true;
+                    self.drain_watch_log();
+                    return;
+                }
                 if self
                     .stop_frame
                     .is_some_and(|stop_frame| self.frame_counter >= stop_frame)

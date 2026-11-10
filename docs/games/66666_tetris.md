@@ -134,6 +134,19 @@ FLIWHEEL_STARTUP_PROGRESS_TRACE=1
 Tetris framebuffer retention and incremental tile-transform handling are now
 automatic for bundle `66666`; no preservation override is required.
 
+`FLIWHEEL_EAPP_ASYNC3_COMPLETE` is on by default (set `0` to turn it off).
+Without it the credits, name entry and menu text never load, which is how the
+Y2 build (which sets no variables) showed them.
+
+Tetris uses the matrix ABI (165 identity, 169/171/173 on the modelview at
+`0x180254c8`, 175 projection × modelview, 125 upload), like Vortex and
+Hold'em. It saves and restores that matrix in memory around each menu item, so
+summing translates lost every parent offset: the labels piled up at the screen
+edge. All its A8 art and fonts are uploaded under GL name `0x8`, so for that
+name the renderer takes the tightest upload containing the UVs (font strips
+only for glyph-sized quads), and its text materials draw untinted: only
+material `0x8` ever gets a colour uniform.
+
 ## Testing Notes
 - Best-tested game in the emulator and current renderer reference
 - GL trace fixture: `core/tests/fixtures/eapp/tetris_gl_trace.json`

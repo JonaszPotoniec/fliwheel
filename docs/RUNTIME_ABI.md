@@ -134,9 +134,9 @@ and the linked game reports.
 | `4` | `Ordinal4State` | state/setup step before upload; exact role unresolved |
 | `157` | `Ordinal157State` | frame-terminal call in Tetris; exact semantics unresolved |
 | `158` | `Ordinal158State` | frame-initial call in Tetris; exact semantics unresolved |
-| `165` | `Ordinal165State` | per-frame setup call; exact semantics unresolved |
-| `169` | `Ordinal169State` | float-arg position/translation-like call; exact semantics unresolved |
-| `125` | `Ordinal125State` | draw-state helper; exact semantics unresolved |
+| `165` | `Ordinal165State` | load identity on the matrix at `r0` (Tetris: modelview `0x180254c8`) |
+| `169` | `Ordinal169State` | translate the matrix at `r0` by `r1`, `r2` (floats) |
+| `125` | `Ordinal125State` | upload the MVP at `r3` (Tetris: `0x18025508`) |
 | `36` | `Ordinal36State` | post-draw helper; exact semantics unresolved |
 
 ### Per-frame sequence (conservative)
@@ -151,8 +151,8 @@ for each quad:
     Ordinal40State(...)   → enable array
     Ordinal137Array(...)  → texcoord array format
     Ordinal40State(...)   → enable array
-    Ordinal175State(...)
-    Ordinal125State(...)
+    Ordinal175State(...)  → multiply r1 × r2 into r0 (projection × modelview → MVP)
+    Ordinal125State(...)  → upload that MVP
     DrawArrays(7, 0, 4)
     Ordinal36State(...)
 Ordinal157State(...)      → frame-terminal call in Tetris, exact semantics unresolved
@@ -278,7 +278,9 @@ Verified end to end on Vortex only: the Menu route writes `options`, `quicka`, `
 
 Tetris's saver (`0x154c0`) only reaches `#12` when the fields at `+0x118` and `+0x11c` of its save object are set, and no scripted route has reached it yet.
 
-The frame vector's context byte is a lifecycle state: 0 init, 1 frame, 5 suspend or quit, 6 ending (Tetris: Menu sets a quit flag at `0x5034`, then 5, then 6). Fliwheel does not drive 5 from the host. Quitting presses Menu and waits for the save files to settle.
+The frame vector's context byte is a lifecycle state: 0 init, 1 frame, 5 suspend or quit, 6 ending (Tetris: Menu sets a quit flag at `0x5034`, then 5, then 6). The game copies it to `app_object[0]` before each frame returns. Fliwheel does not drive 5 from the host. Quitting presses Menu and waits for the save files to settle.
+
+A game that ends by itself (Tetris's own Quit, after saving `prefs.sav`) stays in 6 and returns at once from every later frame, showing its last frame ("SAVING") forever. After each frame the core checks the byte: at 6 it writes pending saves, sets `Eapp::finished_signal` and halts. The Android bridge exposes it as `nativeIsFinished`, and the player goes back to the games list. LOST and the Sims engine are left out, since their reason byte comes from the host.
 
 ## 10. HLE Implementation Guide
 

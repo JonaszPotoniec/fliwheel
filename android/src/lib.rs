@@ -26,6 +26,8 @@ struct EmulatorSession {
     touch_cb: Box<dyn FnMut(Option<u8>) + Send>,
     audio_queue: EappAudioEventQueue,
     stop_signal: Arc<AtomicBool>,
+    /// The game quit by itself (see `Eapp::finished_signal`).
+    finished: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     flush_saves: Arc<AtomicBool>,
     save_commits: Arc<AtomicU64>,
@@ -148,11 +150,13 @@ fn init_session(env: &mut JNIEnv, bundle_path: JString, save_root: Option<String
     };
 
     let stop_signal = system.stop_signal();
+    let finished = system.finished_signal();
     let frame_seq = system.frame_seq();
 
     let log_path = bundle_path_str.clone();
     let frame_seq_clone = Arc::clone(&frame_seq);
     let stop_signal_clone = Arc::clone(&stop_signal);
+    let finished_clone = Arc::clone(&finished);
     let paused = Arc::new(AtomicBool::new(false));
     let paused_clone = Arc::clone(&paused);
     let flush_saves = Arc::new(AtomicBool::new(false));
@@ -185,6 +189,12 @@ fn init_session(env: &mut JNIEnv, bundle_path: JString, save_root: Option<String
                         break;
                     }
                 }
+                // The core has already written the saves. Without this the
+                // thread spins on a halted core until the session is destroyed.
+                if finished_clone.load(Ordering::Relaxed) {
+                    append_game_log("The game has ended");
+                    break;
+                }
                 if last_log_time.elapsed().as_secs() >= 5 {
                     let cur_seq = frame_seq_clone.load(Ordering::Relaxed);
                     let total_secs = start_time.elapsed().as_secs();
@@ -208,6 +218,7 @@ fn init_session(env: &mut JNIEnv, bundle_path: JString, save_root: Option<String
         touch_cb,
         audio_queue: audio_events,
         stop_signal,
+        finished,
         paused,
         flush_saves,
         save_commits,
@@ -385,6 +396,9 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeRequestQui
         return;
     }
     let session = unsafe { &mut *(handle as *mut EmulatorSession) };
+    if session.finished.load(Ordering::Relaxed) {
+        return;
+    }
     session.paused.store(false, Ordering::Relaxed);
     let mut seen = session.save_commits.load(Ordering::Relaxed);
     if let Some(press) = session.key_callbacks.get_mut(&EappKey::Menu) {
@@ -405,6 +419,20 @@ pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeRequestQui
             break;
         }
     }
+}
+
+/// True once the game has quit by itself; the host should close it.
+#[no_mangle]
+pub extern "system" fn Java_com_themoon_y1_games_FliwheelBridge_nativeIsFinished(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    let session = unsafe { &*(handle as *const EmulatorSession) };
+    session.finished.load(Ordering::Relaxed) as jboolean
 }
 
 /// Frees the session. The caller must make sure no other native call on this handle
