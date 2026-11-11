@@ -313,7 +313,8 @@ pub struct LiveGlState {
     pub presented: Option<Vec<Rgba8>>,
     // --- continuous frame assembly (double-buffered) ---
     /// Last fully-rendered internal frame (copied from `framebuffer` at
-    /// present). The window never reads the active `framebuffer`.
+    /// present). Only the frame hashes read it, so it is refreshed only while
+    /// those are computed (see `frame_hashes_wanted`).
     pub completed_buffer: Vec<Rgba8>,
     /// Host-facing presented buffer (completed + optional vflip).
     pub presented_buffer: Vec<Rgba8>,
@@ -344,6 +345,9 @@ pub struct LiveGlState {
     pub dump_remaining: usize,
     pub dump_counter: usize,
     // --- consecutive-frame hash tracking ---
+    /// Hash every completed frame even when `EAPP_GL` info logging is off.
+    /// The startup capture names its dumps after these hashes.
+    pub force_frame_hashes: bool,
     pub first_presented_hash: Option<u64>,
     pub prev_presented_hash: Option<u64>,
     pub first_changed_frame: Option<u64>,
@@ -418,6 +422,7 @@ impl LiveGlState {
             diagnostics_budget: 120,
             dump_remaining: 0,
             dump_counter: 0,
+            force_frame_hashes: false,
             first_presented_hash: None,
             prev_presented_hash: None,
             first_changed_frame: None,
@@ -723,8 +728,12 @@ impl LiveGlState {
         }
     }
 
-    /// Finalize the active frame at the candidate present event (ordinal 157).
-    /// Copies active → completed → presented (with optional vflip) and returns
+    /// True when someone reads the per-frame hashes: `EAPP_GL` info logging
+    /// (the harness and RE runs) or the startup capture.
+    fn frame_hashes_wanted(&self) -> bool {
+        self.force_frame_hashes || log::log_enabled!(target: "EAPP_GL", log::Level::Info)
+    }
+
     /// Composite the DMA-rendered RGB565 background with the live_gl
     /// framebuffer. PopCap engine writes its background into hardware DMA
     /// buffer at 0x1402_0000, then GL draws overlay text/sprites on top.
@@ -757,6 +766,14 @@ impl LiveGlState {
                 let b8 = (b << 3) | (b >> 2);
                 let dst = self.framebuffer[y * FB_WIDTH + x];
                 let alpha = dst.a as u32;
+                // The two ends of the blend below, without the divisions.
+                if alpha == 0 {
+                    self.framebuffer[y * FB_WIDTH + x] = Rgba8::rgba(r8, g8, b8, 255);
+                    continue;
+                }
+                if alpha == 255 {
+                    continue;
+                }
                 // Alpha blend: dst over DMA background
                 let inv_a = 255 - alpha;
                 let out_r = ((r8 as u32 * inv_a + dst.r as u32 * alpha) / 255) as u8;
@@ -770,6 +787,8 @@ impl LiveGlState {
         }
     }
 
+    /// Finalize the active frame at the candidate present event (ordinal 157).
+    /// Copies active → presented (with optional vflip) and returns
     /// the completed-frame metadata. Returns None if no frame is active
     /// (present without begin). The active `framebuffer` is left untouched;
     /// it is cleared by the next boundary reset / begin.
@@ -793,13 +812,20 @@ impl LiveGlState {
             // content. Instead, keep the previously presented frame and just
             // advance the index.
             self.completed_frame_index += 1;
-            let prev_hash = framebuffer_hash(&self.presented_buffer);
+            let (internal_hash, presented_hash) = if self.frame_hashes_wanted() {
+                (
+                    framebuffer_hash(&self.completed_buffer),
+                    framebuffer_hash(&self.presented_buffer),
+                )
+            } else {
+                (0, 0)
+            };
             return Some(CompletedFrame {
                 index: self.completed_frame_index,
                 draw_count,
                 skipped_draws: self.skipped_draws_this_frame,
-                internal_hash: framebuffer_hash(&self.completed_buffer),
-                presented_hash: prev_hash,
+                internal_hash,
+                presented_hash,
                 handle_signature: vec![],
             });
         }
@@ -810,33 +836,46 @@ impl LiveGlState {
             ));
         }
 
-        self.completed_buffer.copy_from_slice(&self.framebuffer);
-        let mut presented = self.framebuffer.clone();
         // Pixel-coord engines (Tetris) render bottom-to-top so need vflip.
         // NDC engines (Sudoku/Solitaire) render top-to-bottom and don't.
         if self.present_vflip && !self.ndc_frame {
-            flip_vertical_in_place(&mut presented, FB_WIDTH, FB_HEIGHT);
+            for (dst, src) in self
+                .presented_buffer
+                .chunks_exact_mut(FB_WIDTH)
+                .zip(self.framebuffer.chunks_exact(FB_WIDTH).rev())
+            {
+                dst.copy_from_slice(src);
+            }
+        } else {
+            self.presented_buffer.copy_from_slice(&self.framebuffer);
         }
-        self.presented_buffer.copy_from_slice(&presented);
-        self.presented = Some(presented);
         self.completed_frame_index += 1;
-
-        let internal_hash = framebuffer_hash(&self.completed_buffer);
-        let presented_hash = framebuffer_hash(&self.presented_buffer);
         let handle_signature: Vec<u32> = self.draws.iter().map(|d| d.handle).collect();
 
-        // Consecutive-frame hash tracking (req 12). A repeated splash is not
-        // treated as broken.
-        if self.first_presented_hash.is_none() {
-            self.first_presented_hash = Some(presented_hash);
-        }
-        if self.prev_presented_hash == Some(presented_hash) {
-            self.repeated_presented_count += 1;
-        } else if self.completed_frame_index > 1 && self.first_changed_frame.is_none() {
-            self.first_changed_frame = Some(self.completed_frame_index);
-        }
-        self.prev_presented_hash = Some(presented_hash);
-        self.unique_presented_hashes.insert(presented_hash);
+        // The hashes only feed diagnostics. Walking both 300 KB buffers a
+        // byte at a time costs more than presenting the frame, so a normal
+        // run skips them and reports zero.
+        let (internal_hash, presented_hash) = if self.frame_hashes_wanted() {
+            self.completed_buffer.copy_from_slice(&self.framebuffer);
+            let internal_hash = framebuffer_hash(&self.completed_buffer);
+            let presented_hash = framebuffer_hash(&self.presented_buffer);
+
+            // Consecutive-frame hash tracking (req 12). A repeated splash is
+            // not treated as broken.
+            if self.first_presented_hash.is_none() {
+                self.first_presented_hash = Some(presented_hash);
+            }
+            if self.prev_presented_hash == Some(presented_hash) {
+                self.repeated_presented_count += 1;
+            } else if self.completed_frame_index > 1 && self.first_changed_frame.is_none() {
+                self.first_changed_frame = Some(self.completed_frame_index);
+            }
+            self.prev_presented_hash = Some(presented_hash);
+            self.unique_presented_hashes.insert(presented_hash);
+            (internal_hash, presented_hash)
+        } else {
+            (0, 0)
+        };
 
         Some(CompletedFrame {
             index: self.completed_frame_index,

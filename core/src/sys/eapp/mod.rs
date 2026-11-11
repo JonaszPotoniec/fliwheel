@@ -81,20 +81,31 @@ const LEGACY_SAVE_DIR: &str = ".clicky-saves";
 /// Read a fliwheel runtime option by its suffix. New callers use the
 /// `FLIWHEEL_` namespace; the old `CLICKY_` spelling remains a deliberate,
 /// centralized compatibility alias for existing experiments and scripts.
+///
+/// Each option is read from the environment once per thread and then
+/// remembered: several are consulted on every import call or frame, and the
+/// environment does not change while a title runs.
 fn fliwheel_var_os(suffix: &str) -> Option<std::ffi::OsString> {
-    let current = format!("FLIWHEEL_{}", suffix);
-    let legacy = format!("{}{}", LEGACY_ENV_PREFIX, suffix);
-    std::env::var_os(current).or_else(|| std::env::var_os(legacy))
+    thread_local! {
+        static OPTIONS: std::cell::RefCell<HashMap<String, Option<std::ffi::OsString>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    OPTIONS.with(|options| {
+        if let Some(value) = options.borrow().get(suffix) {
+            return value.clone();
+        }
+        let current = format!("FLIWHEEL_{}", suffix);
+        let legacy = format!("{}{}", LEGACY_ENV_PREFIX, suffix);
+        let value = std::env::var_os(current).or_else(|| std::env::var_os(legacy));
+        options.borrow_mut().insert(suffix.to_string(), value.clone());
+        value
+    })
 }
 
 fn fliwheel_var(suffix: &str) -> Result<String, std::env::VarError> {
-    let current = format!("FLIWHEEL_{}", suffix);
-    match std::env::var(current) {
-        Ok(value) => Ok(value),
-        Err(std::env::VarError::NotPresent) => {
-            std::env::var(format!("{}{}", LEGACY_ENV_PREFIX, suffix))
-        }
-        Err(error) => Err(error),
+    match fliwheel_var_os(suffix) {
+        Some(value) => value.into_string().map_err(std::env::VarError::NotUnicode),
+        None => Err(std::env::VarError::NotPresent),
     }
 }
 
@@ -618,7 +629,8 @@ pub struct EappImage {
 
 #[derive(Debug, Clone)]
 struct BoundImport {
-    module: String,
+    /// Shared, so that taking a copy for each import call does not allocate.
+    module: Arc<str>,
     ordinal: u32,
 }
 
@@ -735,7 +747,8 @@ pub struct Eapp {
     header: EappHeader,
     imports: Vec<BoundImport>,
     trampoline_to_import: HashMap<u32, usize>,
-    logged_imports: HashSet<(String, u32)>,
+    /// Imports already reported once, by index into `imports`.
+    logged_imports: Vec<bool>,
     recent_pcs: VecDeque<u32>,
     input_state: Arc<Mutex<EappInputState>>,
     /// Previous logical InputEvents event-id mask. The firmware event-list API
@@ -819,9 +832,10 @@ pub struct Eapp {
     guest_pc_trace_hits: HashMap<u32, u32>,
     guest_pc_trace_limit: u32,
     /// Per-(module, ordinal) call counters, to find render-critical imports.
-    import_call_counts: HashMap<(String, u32), u64>,
+    /// Calls per import, by index into `imports`.
+    import_call_counts: Vec<u64>,
     /// Per-frame import counters used by the optional startup-progress trace.
-    frame_import_counts: HashMap<(String, u32), u64>,
+    frame_import_counts: Vec<u64>,
     startup_progress: StartupProgressTrace,
     startup_capture: StartupArtifactCapture,
     startup_signature_reports: HashSet<String>,
@@ -1179,7 +1193,7 @@ impl Eapp {
                     .copy_from_slice(&trampoline_addr.to_le_bytes());
 
                 imports.push(BoundImport {
-                    module: module.name.clone(),
+                    module: module.name.as_str().into(),
                     ordinal,
                 });
                 trampoline_to_import.insert(trampoline_addr, import_idx);
@@ -1187,6 +1201,7 @@ impl Eapp {
             }
         }
 
+        let import_count = imports.len();
         let mapped_image_len = patched_image.len() + IMAGE_RAM_SLACK;
         let mut image_ram = Ram::new(mapped_image_len);
         let image_zeroes = vec![0u8; mapped_image_len];
@@ -1253,7 +1268,7 @@ impl Eapp {
             header: image.header,
             imports,
             trampoline_to_import,
-            logged_imports: HashSet::new(),
+            logged_imports: vec![false; import_count],
             recent_pcs: VecDeque::with_capacity(RECENT_PC_LIMIT),
             input_state,
             input_event_prev_mask: 0,
@@ -1290,8 +1305,8 @@ impl Eapp {
             guest_pc_trace_pcs: Self::parse_pc_trace_env(),
             guest_pc_trace_hits: HashMap::new(),
             guest_pc_trace_limit: Self::parse_pc_trace_limit_env(),
-            import_call_counts: HashMap::new(),
-            frame_import_counts: HashMap::new(),
+            import_call_counts: vec![0; import_count],
+            frame_import_counts: vec![0; import_count],
             startup_progress: StartupProgressTrace::from_env(),
             startup_capture: StartupArtifactCapture::from_env(),
             startup_signature_reports: HashSet::new(),
@@ -1680,11 +1695,16 @@ impl Eapp {
     /// Log the most-frequent import calls seen so far. Useful for finding
     /// render-critical ordinals inside the per-frame loop.
     pub fn log_top_imports(&self, limit: usize) {
-        let mut counts: Vec<(&(String, u32), &u64)> = self.import_call_counts.iter().collect();
-        counts.sort_by(|a, b| b.1.cmp(a.1));
+        let mut counts: Vec<(&BoundImport, u64)> = self
+            .imports
+            .iter()
+            .zip(self.import_call_counts.iter().copied())
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
         let mut rendered = String::new();
-        for ((module, ordinal), count) in counts.into_iter().take(limit) {
-            rendered.push_str(&format!("\n    {}:{} = {}", module, ordinal, count));
+        for (import, count) in counts.into_iter().take(limit) {
+            rendered.push_str(&format!("\n    {}:{} = {}", import.module, import.ordinal, count));
         }
         info!(target: "EAPP", "top {} imports by call count:{}", limit, rendered);
     }
@@ -2581,15 +2601,14 @@ impl Eapp {
             self.cpu.reg_get(self.cpu.mode(), 3),
         ];
 
-        let key = (import.module.clone(), import.ordinal);
-        *self.import_call_counts.entry(key.clone()).or_insert(0u64) += 1;
-        *self.frame_import_counts.entry(key.clone()).or_insert(0u64) += 1;
+        self.import_call_counts[import_idx] += 1;
+        self.frame_import_counts[import_idx] += 1;
 
         let in_gl_trace = self
             .gl_trace_frames
             .map(|(s, e)| self.frame_counter >= s && self.frame_counter <= e)
             .unwrap_or(false);
-        if in_gl_trace && import.module == "OpenGLES" {
+        if in_gl_trace && &*import.module == "OpenGLES" {
             info!(
                 target: "EAPP_GL",
                 "frame {} GL:{} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
@@ -2603,7 +2622,7 @@ impl Eapp {
             );
         }
 
-        if self.logged_imports.insert(key.clone()) {
+        if !std::mem::replace(&mut self.logged_imports[import_idx], true) {
             info!(
                 target: "EAPP_IMPORT",
                 "{}:{} pc={:#010x} lr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
@@ -2627,13 +2646,13 @@ impl Eapp {
             );
         }
 
-        if matches!(import.module.as_str(), "AsyncFileIO" | "Filesytem")
+        if matches!(&*import.module, "AsyncFileIO" | "Filesytem")
             && fliwheel_var_os("FILE_TRACE").is_some()
         {
             self.trace_file_import(&import.module, import.ordinal, pc, lr, args);
         }
 
-        let ret = match import.module.as_str() {
+        let ret = match &*import.module {
             "OpenGLES" => self.handle_open_gl_import(import.ordinal, args),
             "InputEvents" => self.handle_input_events_import(import.ordinal, args),
             "Settings" => self.handle_settings_import(import.ordinal, args),
@@ -2649,11 +2668,11 @@ impl Eapp {
             }
         };
 
-        if import.module == "OpenGLES" {
+        if &*import.module == "OpenGLES" {
             self.capture_open_gl_import(import.ordinal, pc, lr, args, ret);
         }
 
-        if import.module == "Audio" && fliwheel_var_os("AUDIO_TRACE").is_some() {
+        if &*import.module == "Audio" && fliwheel_var_os("AUDIO_TRACE").is_some() {
             info!(
                 target: "EAPP_AUDIO",
                 "AudioRet:{} frame={} lr={:#010x} ret={:#010x}",
@@ -2670,7 +2689,7 @@ impl Eapp {
         // lets any faulting work-RAM object be attributed to the guest call
         // site that created it. Useful for null-vtable / null-deref teardown
         // investigations.
-        if import.module == "miscTBD"
+        if &*import.module == "miscTBD"
             && import.ordinal == 0
             && fliwheel_var_os("ALLOC_TRACE").is_some()
         {
@@ -2893,6 +2912,8 @@ impl Eapp {
         );
         let mut lg = LiveGlState::new(present_vflip, gate_b, continuous, game_id);
         lg.dump_remaining = dump_frames;
+        // The startup capture names its frame dumps after the frame hashes.
+        lg.force_frame_hashes = fliwheel_var_os("STARTUP_CAPTURE_DIR").is_some();
         Some(lg)
     }
 
@@ -6812,6 +6833,10 @@ impl Eapp {
     /// Emit a bounded, detailed draw report the first time a completed-frame
     /// signature appears. This is for visual-accuracy triage, not rendering.
     fn live_log_signature_detail(&mut self, frame: &live_gl::CompletedFrame) {
+        // Building the signature key allocates per draw, every frame.
+        if !log::log_enabled!(target: "EAPP_GL", log::Level::Info) {
+            return;
+        }
         let key = frame
             .handle_signature
             .iter()
@@ -7023,12 +7048,11 @@ impl Eapp {
     /// Gate B for continuous rendering: publish the most recent completed
     /// presented frame to the desktop window under the render-state mutex.
     fn live_present_completed_to_window(&mut self) {
-        let presented = match self.live_gl.as_ref() {
-            Some(lg) => lg.presented_buffer.clone(),
-            None => return,
+        let Some(lg) = self.live_gl.as_ref() else {
+            return;
         };
         let mut frame = self.render_state.lock().unwrap();
-        for (dst, src) in frame.iter_mut().zip(presented.iter()) {
+        for (dst, src) in frame.iter_mut().zip(lg.presented_buffer.iter()) {
             *dst = 0xff00_0000 | ((src.r as u32) << 16) | ((src.g as u32) << 8) | (src.b as u32);
         }
         drop(frame);
@@ -10882,16 +10906,18 @@ impl Eapp {
     }
 
     fn format_frame_import_counts(&self, limit: usize) -> String {
-        let mut counts: Vec<_> = self
-            .frame_import_counts
+        let mut counts: Vec<(&str, u32, u64)> = self
+            .imports
             .iter()
-            .filter(|((module, _), _)| module != "OpenGLES")
+            .zip(self.frame_import_counts.iter().copied())
+            .filter(|(import, count)| *count > 0 && &*import.module != "OpenGLES")
+            .map(|(import, count)| (&*import.module, import.ordinal, count))
             .collect();
-        counts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        counts.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| (a.0, a.1).cmp(&(b.0, b.1))));
         counts
             .into_iter()
             .take(limit)
-            .map(|((module, ordinal), count)| format!("{}:{}={}", module, ordinal, count))
+            .map(|(module, ordinal, count)| format!("{}:{}={}", module, ordinal, count))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -11015,7 +11041,7 @@ impl Eapp {
                     );
                 }
                 self.maybe_log_startup_progress();
-                self.frame_import_counts.clear();
+                self.frame_import_counts.fill(0);
                 self.queue_retail_completions();
                 if !self.dispatch_pending_guest_call() {
                     self.queue_next_frame();
