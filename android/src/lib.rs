@@ -14,6 +14,28 @@ use jni::objects::{JClass, JIntArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
+/// Author ELF note, placed by the linker right after the ELF headers
+/// (`readelf -n` shows it). Note layout: namesz, descsz, type, name, desc,
+/// each padded to 4 bytes.
+#[repr(C)]
+struct ElfNote<const N: usize, const D: usize> {
+    namesz: u32,
+    descsz: u32,
+    kind: u32,
+    name: [u8; N],
+    desc: [u8; D],
+}
+
+#[used]
+#[link_section = ".note.author"]
+static AUTHOR_NOTE: ElfNote<8, 40> = ElfNote {
+    namesz: 7,
+    descsz: 40,
+    kind: 1,
+    name: *b"Classy\0\0",
+    desc: *b"Jonasz Potoniec for ClassyPlayer/Classy\0",
+};
+
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 const QUIT_MENU_PRESS: Duration = Duration::from_millis(120);
 const QUIT_SAVE_TIMEOUT: Duration = Duration::from_millis(2000);
